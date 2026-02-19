@@ -197,3 +197,27 @@ This iteration felt like a careful compromise between architectural direction an
 I’m more confident in the maintainability outcome than in the immediate optimality of transferred bytes for all real-world pointer shapes. The upside is we now have clean seams to improve correctness (swap hydrator implementation), testability (pure unit tests with fake hydrators), and performance (cache-aware planning) incrementally.
 
 The tradeoff I kept revisiting was whether to attempt invasive xet-core integration now or stabilize planner interfaces first. Given sprint scope and CI reliability requirements, interface-first felt safer and easier to verify end-to-end. The e2e enhancement gives a concrete signal that default mode is more minimal than full sync, which helps validate product direction while acknowledging we still have room to improve exactness.
+
+## 2026-02-19 (commit: pending) — Core command orchestration + RemoteStore + staged transactions
+
+### What changed
+- Added `xet_ai_core::commands` and moved init/push/pull/remote/manifest orchestration into core.
+- Simplified CLI so it is mostly clap parsing + delegating into core commands; kept clean/smudge in binary.
+- Introduced `RemoteStore` trait and `FilesystemRemoteStore` with atomic write/copy primitives and prefix listing.
+- Refactored push/pull to use `RemoteStore` operations instead of direct remote path manipulation.
+- Made minimal manifest subset building O(N relpaths) by iterating requested relpaths directly rather than walking full CAS.
+- Added default push mode semantics:
+  - minimal + validation (`PushMode::MinimalValidate`),
+  - full fallback (`--all-cas`),
+  - unsafe developer mode (`--minimal-no-validate`).
+- Implemented local validation workflow for minimal push using isolated `.xet_ai/validate/<sha>/xet` CAS and representative pointer hydration to sink.
+- Added staged transactional publish layout under `tx/<txid>/...` with commit marker `tx/COMMITTED/<txid>`, then live finalize ordering.
+- Added `xet-ai remote tx list` command and e2e assertion that tx directories exist on remote.
+- Pull now fetches pointer index best-effort into `.xet_ai/pointers/<sha>.json`.
+
+### State of mind / reflections
+This pass felt like finally crossing from "feature accumulation" to "system boundaries." The biggest cognitive load was deciding where responsibilities should live: CLI ergonomics versus core orchestration versus backend IO boundaries. The new `RemoteStore` trait is intentionally small and filesystem-biased in this iteration, and I’m aware there is still a gap to a truly streaming/object-store-native backend. But creating an explicit seam now felt more valuable than perfecting every operation shape in one go.
+
+The validation-vs-performance tradeoff is still front of mind. I chose to prioritize correctness by validating minimal plans before publish, even though it adds local work. The fallback-to-all-cas behavior may look conservative, but it is the right safety rail while reachability remains heuristic. I’d rather absorb a temporary performance hit than risk publishing refs that cannot hydrate.
+
+Transactional publish sequencing also improved my confidence: writing staged artifacts and only moving live pointers at the end makes crash behavior significantly less scary. I still think we should eventually add explicit transaction GC and richer telemetry so operators can inspect long-lived staged directories, but the current shape already reduces partial-state risk in a tangible way.

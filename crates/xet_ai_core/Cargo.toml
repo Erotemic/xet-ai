@@ -13,3 +13,4 @@ uuid = { version = "1", features = ["v4"] }
 sha2 = "0.10"
 git2 = "0.19"
 data = { package = "data", git = "https://github.com/huggingface/xet-core", rev = "a7661a7e63626466561e88e63113001a193a36ee" }
+file_reconstruction = { package = "file_reconstruction", git = "https://github.com/huggingface/xet-core", rev = "a7661a7e63626466561e88e63113001a193a36ee" }

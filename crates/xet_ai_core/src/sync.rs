@@ -10,6 +10,8 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
+use crate::remote::RemoteStore;
+
 pub const HASH_VERIFY_LIMIT: u64 = 8 * 1024 * 1024;
 const ALLOWLIST_TOP_LEVEL: &[&str] = &["cas", "shards", "mdb", "xorbs", "merkledb"];
 
@@ -215,10 +217,41 @@ fn build_manifest_with_hasher(
     let mut entries = Vec::new();
     let mut total_bytes = 0u64;
 
-    let requested: Option<std::collections::HashSet<&str>> =
-        only_relpaths.map(|paths| paths.iter().map(|s| s.as_str()).collect());
+    if let Some(requested_relpaths) = only_relpaths {
+        for relpath in requested_relpaths {
+            let rel = Path::new(relpath);
+            if !sync_included(rel) {
+                continue;
+            }
+            let abs = cas_root.join(relpath);
+            if !abs.exists() {
+                continue;
+            }
 
-    if cas_root.exists() {
+            let size = fs::metadata(&abs)?.len();
+            let sha256 = match cache.entries.get(relpath) {
+                Some(cached) if cached.size == size => cached.sha256.clone(),
+                _ => {
+                    let hash = hasher.hash_file(&abs)?;
+                    cache.entries.insert(
+                        relpath.clone(),
+                        HashCacheEntry {
+                            size,
+                            sha256: hash.clone(),
+                        },
+                    );
+                    hash
+                }
+            };
+
+            total_bytes = total_bytes.saturating_add(size);
+            entries.push(ManifestEntry {
+                relpath: relpath.clone(),
+                size,
+                sha256,
+            });
+        }
+    } else if cas_root.exists() {
         for entry in WalkDir::new(cas_root).into_iter().filter_map(|e| e.ok()) {
             if !entry.file_type().is_file() {
                 continue;
@@ -229,11 +262,6 @@ fn build_manifest_with_hasher(
             }
 
             let relpath = rel.to_string_lossy().to_string();
-            if let Some(requested) = &requested {
-                if !requested.contains(relpath.as_str()) {
-                    continue;
-                }
-            }
             let size = entry.metadata()?.len();
             let sha256 = match cache.entries.get(&relpath) {
                 Some(cached) if cached.size == size => cached.sha256.clone(),
@@ -434,6 +462,59 @@ pub fn pull_from_manifest(
             summary.files_copied += 1;
             summary.bytes_copied += copied;
         }
+        summary.files_verified += 1;
+    }
+
+    Ok(summary)
+}
+
+pub fn push_with_manifest_store(
+    local_cas_root: &Path,
+    remote_store: &dyn RemoteStore,
+    manifest: &Manifest,
+) -> Result<SyncSummary> {
+    let mut summary = SyncSummary::default();
+
+    for entry in &manifest.entries {
+        let src = local_cas_root.join(&entry.relpath);
+        let remote_relpath = format!("xet/{}", entry.relpath);
+        if remote_store.exists(&remote_relpath)? {
+            summary.files_verified += 1;
+            continue;
+        }
+        remote_store.copy_from_local_atomic(&src, &remote_relpath)?;
+        summary.files_copied += 1;
+        summary.bytes_copied += entry.size;
+        summary.files_verified += 1;
+    }
+
+    Ok(summary)
+}
+
+pub fn pull_from_manifest_store(
+    remote_store: &dyn RemoteStore,
+    local_cas_root: &Path,
+    manifest: &Manifest,
+) -> Result<SyncSummary> {
+    let mut summary = SyncSummary::default();
+
+    for entry in &manifest.entries {
+        let remote_relpath = format!("xet/{}", entry.relpath);
+        if !remote_store.exists(&remote_relpath)? {
+            bail!(
+                "remote CAS file referenced by manifest is missing: {}",
+                remote_relpath
+            );
+        }
+
+        let dst = local_cas_root.join(&entry.relpath);
+        if dst.exists() {
+            summary.files_verified += 1;
+            continue;
+        }
+        remote_store.copy_to_local_atomic(&remote_relpath, &dst)?;
+        summary.files_copied += 1;
+        summary.bytes_copied += entry.size;
         summary.files_verified += 1;
     }
 

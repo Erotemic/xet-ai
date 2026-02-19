@@ -76,6 +76,13 @@ ref_main="$remote_dir/$repo_id/refs/main"
 [[ -f ".xet_ai/manifests/$sha1.json" ]] || { echo "missing local cached manifest after push1" >&2; exit 1; }
 [[ ! -f "$remote_dir/$repo_id/locks/push.lock" ]] || { echo "push lock left behind" >&2; exit 1; }
 
+tx_dir="$remote_dir/$repo_id/tx"
+[[ -d "$tx_dir" ]] || { echo "missing remote tx dir" >&2; exit 1; }
+if [[ -z "$(find "$tx_dir" -mindepth 1 -maxdepth 1 -type d | head -n1)" ]]; then
+  echo "expected at least one transaction directory" >&2
+  exit 1
+fi
+
 python3 - <<'PY'
 from pathlib import Path
 chunk = 1024 * 1024
