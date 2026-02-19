@@ -29,5 +29,12 @@ jobs:
       - name: Release build
         run: cargo build --release
 
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: ShellCheck
+        run: shellcheck scripts/e2e.sh
+
       - name: E2E
         run: bash scripts/e2e.sh

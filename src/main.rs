@@ -2,6 +2,7 @@ mod config;
 mod repo;
 mod sync;
 
+use std::cmp::Reverse;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -50,6 +51,10 @@ enum Commands {
         #[command(subcommand)]
         command: DebugCommands,
     },
+    Manifest {
+        #[command(subcommand)]
+        command: ManifestCommands,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -61,6 +66,13 @@ enum RemoteCommands {
 #[derive(Subcommand, Debug)]
 enum DebugCommands {
     CasTree,
+}
+
+#[derive(Subcommand, Debug)]
+enum ManifestCommands {
+    List,
+    Show { sha: String },
+    Verify { sha: String },
 }
 
 fn runtime() -> Arc<XetRuntime> {
@@ -98,6 +110,11 @@ async fn run() -> Result<()> {
         },
         Commands::Debug { command } => match command {
             DebugCommands::CasTree => debug_cas_tree(),
+        },
+        Commands::Manifest { command } => match command {
+            ManifestCommands::List => manifest_list(),
+            ManifestCommands::Show { sha } => manifest_show(&sha),
+            ManifestCommands::Verify { sha } => manifest_verify(&sha),
         },
     }
 }
@@ -249,6 +266,76 @@ fn debug_cas_tree() -> Result<()> {
     Ok(())
 }
 
+fn manifest_dir(repo_root: &Path) -> PathBuf {
+    repo_root.join(".xet_ai").join("manifests")
+}
+
+fn manifest_path(repo_root: &Path, sha: &str) -> PathBuf {
+    manifest_dir(repo_root).join(format!("{sha}.json"))
+}
+
+fn manifest_list() -> Result<()> {
+    let repo_root = repo::repo_root()?;
+    let dir = manifest_dir(&repo_root);
+    if !dir.exists() {
+        return Ok(());
+    }
+
+    let mut rows: Vec<(String, usize, u64)> = Vec::new();
+    for entry in fs::read_dir(&dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let manifest = sync::read_manifest(&path)?;
+        let sha = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        rows.push((sha, manifest.entries.len(), manifest.total_bytes));
+    }
+
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    for (sha, count, total) in rows {
+        println!("{sha}\tentries={count}\ttotal_bytes={total}");
+    }
+    Ok(())
+}
+
+fn manifest_show(sha: &str) -> Result<()> {
+    let repo_root = repo::repo_root()?;
+    let path = manifest_path(&repo_root, sha);
+    let manifest = sync::read_manifest(&path)?;
+
+    println!("repo_id: {}", manifest.repo_id);
+    println!("git_sha: {}", manifest.git_sha);
+    println!("entries: {}", manifest.entries.len());
+    println!("total_bytes: {}", manifest.total_bytes);
+
+    let mut entries = manifest.entries.clone();
+    entries.sort_by_key(|e| Reverse(e.size));
+    println!("largest_entries:");
+    for e in entries.into_iter().take(10) {
+        println!("  {}\t{}", e.size, e.relpath);
+    }
+    Ok(())
+}
+
+fn manifest_verify(sha: &str) -> Result<()> {
+    let repo_root = repo::repo_root()?;
+    let path = manifest_path(&repo_root, sha);
+    let manifest = sync::read_manifest(&path)?;
+    let local_cas_root = repo_root.join(".xet_ai").join("xet");
+
+    let summary = sync::verify_manifest_local(&local_cas_root, &manifest)?;
+    println!(
+        "verified {} files for manifest {}",
+        summary.files_verified, manifest.git_sha
+    );
+    Ok(())
+}
+
 fn remote_add(name: &str, path: &Path) -> Result<()> {
     let repo_root = repo::repo_root()?;
     let mut cfg = AppConfig::load(&repo_root)?;
@@ -284,14 +371,19 @@ fn push(name: &str) -> Result<()> {
 
     let repo_id = repo::load_repo_id(&repo_root)?;
     let git_sha = repo::git_head_sha(&repo_root)?;
-    let local_cas_root = repo_root.join(".xet_ai").join("xet");
+    let xet_ai_root = repo_root.join(".xet_ai");
+    let local_cas_root = xet_ai_root.join("xet");
 
     let remote_repo_root = repo::resolve_path(&repo_root, &remote.path).join(&repo_id);
     let remote_cas_root = remote_repo_root.join("xet");
     let remote_manifest_dir = remote_repo_root.join("manifests");
 
-    let manifest = sync::build_manifest(&repo_id, &git_sha, &local_cas_root)?;
+    let hash_cache_path = xet_ai_root.join("hash_cache.json");
+    let manifest = sync::build_manifest(&repo_id, &git_sha, &local_cas_root, &hash_cache_path)?;
     let summary = sync::push_with_manifest(&local_cas_root, &remote_cas_root, &manifest)?;
+
+    let local_manifest_path = manifest_path(&repo_root, &git_sha);
+    sync::cache_manifest(&local_manifest_path, &manifest)?;
 
     let manifest_path = remote_manifest_dir.join(format!("{git_sha}.json"));
     sync::write_manifest_atomic(&manifest_path, &manifest)?;
@@ -336,10 +428,7 @@ fn pull(name: &str, git_ref: Option<&str>) -> Result<()> {
     let remote_manifest_path = remote_manifest_dir.join(format!("{sha}.json"));
     let manifest = sync::read_manifest(&remote_manifest_path)?;
 
-    let local_manifest_path = repo_root
-        .join(".xet_ai")
-        .join("manifests")
-        .join(format!("{sha}.json"));
+    let local_manifest_path = manifest_path(&repo_root, &sha);
     sync::cache_manifest(&local_manifest_path, &manifest)?;
 
     let local_cas_root = repo_root.join(".xet_ai").join("xet");

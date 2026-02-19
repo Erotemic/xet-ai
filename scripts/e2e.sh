@@ -65,6 +65,7 @@ manifest_head="$remote_dir/$repo_id/manifests/HEAD"
 manifest_sha1="$remote_dir/$repo_id/manifests/$sha1.json"
 [[ -f "$manifest_head" ]] || { echo "missing remote HEAD manifest ref" >&2; exit 1; }
 [[ -f "$manifest_sha1" ]] || { echo "missing remote manifest $sha1" >&2; exit 1; }
+[[ -f ".xet_ai/manifests/$sha1.json" ]] || { echo "missing local cached manifest $sha1 after push" >&2; exit 1; }
 [[ "$(tr -d '\n' < "$manifest_head")" == "$sha1" ]] || { echo "HEAD ref mismatch" >&2; exit 1; }
 
 python3 - <<'PY'
@@ -86,6 +87,7 @@ bytes_push2="$(echo "$push2_output" | extract_bytes)"
 
 manifest_sha2="$remote_dir/$repo_id/manifests/$sha2.json"
 [[ -f "$manifest_sha2" ]] || { echo "missing remote manifest $sha2" >&2; exit 1; }
+[[ -f ".xet_ai/manifests/$sha2.json" ]] || { echo "missing local cached manifest $sha2 after push2" >&2; exit 1; }
 [[ "$(tr -d '\n' < "$manifest_head")" == "$sha2" ]] || { echo "HEAD ref mismatch after push2" >&2; exit 1; }
 
 if (( bytes_push2 >= 20 * 1024 * 1024 )); then
@@ -120,6 +122,8 @@ if [[ ! -f ".xet_ai/manifests/$sha2.json" ]]; then
   echo "expected pulled local manifest cache" >&2
   exit 1
 fi
+
+xet-ai manifest verify "$sha2" >/dev/null
 
 git checkout -f -- big.bin
 
