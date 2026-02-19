@@ -49,6 +49,20 @@ pub fn git_head_sha(repo_root: &Path) -> Result<String> {
     run_git_capture_stdout(repo_root, &["rev-parse", "HEAD"])
 }
 
+pub fn git_current_branch_short(repo_root: &Path) -> Result<Option<String>> {
+    let output = Command::new("git")
+        .current_dir(repo_root)
+        .args(["symbolic-ref", "--short", "HEAD"])
+        .output()
+        .context("failed to execute git")?;
+    if output.status.success() {
+        return Ok(Some(
+            String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        ));
+    }
+    Ok(None)
+}
+
 pub fn append_if_missing(path: &Path, line: &str) -> Result<()> {
     let mut content = if path.exists() {
         fs::read_to_string(path)?

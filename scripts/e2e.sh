@@ -34,13 +34,13 @@ git init "$repoA" >/dev/null
 cd "$repoA"
 git config user.email "xet-ai@example.com"
 git config user.name "xet-ai"
+git branch -m main
 
-xet-ai init
+xet-ai init --init-config
 if [[ ! -f .xet_ai_repo_id ]]; then
   echo "missing .xet_ai_repo_id" >&2
   exit 1
 fi
-repo_id="$(tr -d '\n' < .xet_ai_repo_id)"
 
 python3 - <<'PY'
 from pathlib import Path
@@ -52,21 +52,27 @@ with Path('big.bin').open('wb') as f:
         f.write(b)
 PY
 
-git add .
-git commit -m "add big file" >/dev/null
-sha1="$(git rev-parse HEAD)"
-
 xet-ai remote add origin "$remote_dir"
-push1_output="$(xet-ai push origin)"
+xet-ai remote set-default origin
+git add .
+git commit -m "add big file and shared config" >/dev/null
+sha1="$(git rev-parse HEAD)"
+repo_id="$(tr -d '\n' < .xet_ai_repo_id)"
+
+push1_output="$(xet-ai push origin --ref main)"
 echo "$push1_output"
 bytes_push1="$(echo "$push1_output" | extract_bytes)"
-
 manifest_head="$remote_dir/$repo_id/manifests/HEAD"
 manifest_sha1="$remote_dir/$repo_id/manifests/$sha1.json"
-[[ -f "$manifest_head" ]] || { echo "missing remote HEAD manifest ref" >&2; exit 1; }
-[[ -f "$manifest_sha1" ]] || { echo "missing remote manifest $sha1" >&2; exit 1; }
-[[ -f ".xet_ai/manifests/$sha1.json" ]] || { echo "missing local cached manifest $sha1 after push" >&2; exit 1; }
-[[ "$(tr -d '\n' < "$manifest_head")" == "$sha1" ]] || { echo "HEAD ref mismatch" >&2; exit 1; }
+ref_main="$remote_dir/$repo_id/refs/main"
+
+[[ -f "$manifest_head" ]] || { echo "missing remote HEAD" >&2; exit 1; }
+[[ -f "$manifest_sha1" ]] || { echo "missing remote manifest sha1" >&2; exit 1; }
+[[ -f "$ref_main" ]] || { echo "missing remote refs/main" >&2; exit 1; }
+[[ "$(tr -d '\n' < "$manifest_head")" == "$sha1" ]] || { echo "HEAD mismatch" >&2; exit 1; }
+[[ "$(tr -d '\n' < "$ref_main")" == "$sha1" ]] || { echo "refs/main mismatch" >&2; exit 1; }
+[[ -f ".xet_ai/manifests/$sha1.json" ]] || { echo "missing local cached manifest after push1" >&2; exit 1; }
+[[ ! -f "$remote_dir/$repo_id/locks/push.lock" ]] || { echo "push lock left behind" >&2; exit 1; }
 
 python3 - <<'PY'
 from pathlib import Path
@@ -81,14 +87,15 @@ PY
 git add big.bin
 git commit -m "update tail" >/dev/null
 sha2="$(git rev-parse HEAD)"
-push2_output="$(xet-ai push origin)"
+push2_output="$(xet-ai push origin --ref main)"
 echo "$push2_output"
 bytes_push2="$(echo "$push2_output" | extract_bytes)"
 
-manifest_sha2="$remote_dir/$repo_id/manifests/$sha2.json"
-[[ -f "$manifest_sha2" ]] || { echo "missing remote manifest $sha2" >&2; exit 1; }
-[[ -f ".xet_ai/manifests/$sha2.json" ]] || { echo "missing local cached manifest $sha2 after push2" >&2; exit 1; }
-[[ "$(tr -d '\n' < "$manifest_head")" == "$sha2" ]] || { echo "HEAD ref mismatch after push2" >&2; exit 1; }
+[[ -f "$remote_dir/$repo_id/manifests/$sha2.json" ]] || { echo "missing remote manifest sha2" >&2; exit 1; }
+[[ "$(tr -d '\n' < "$manifest_head")" == "$sha2" ]] || { echo "HEAD mismatch after push2" >&2; exit 1; }
+[[ "$(tr -d '\n' < "$ref_main")" == "$sha2" ]] || { echo "refs/main mismatch after push2" >&2; exit 1; }
+[[ -f ".xet_ai/manifests/$sha2.json" ]] || { echo "missing local cached manifest after push2" >&2; exit 1; }
+[[ ! -f "$remote_dir/$repo_id/locks/push.lock" ]] || { echo "push lock left behind after push2" >&2; exit 1; }
 
 if (( bytes_push2 >= 20 * 1024 * 1024 )); then
   echo "Push #2 copied too many bytes: $bytes_push2" >&2
@@ -101,6 +108,7 @@ cd "$machineB"
 git clone "$repoA" "$repoB" >/dev/null
 
 cd "$repoB"
+xet-ai init
 if ! python3 - <<'PY'
 import json
 from pathlib import Path
@@ -114,17 +122,8 @@ then
   exit 1
 fi
 
-xet-ai init
-xet-ai remote add origin "$remote_dir"
-pull_output="$(xet-ai pull origin)"
-echo "$pull_output"
-if [[ ! -f ".xet_ai/manifests/$sha2.json" ]]; then
-  echo "expected pulled local manifest cache" >&2
-  exit 1
-fi
-
+xet-ai pull origin --ref main
 xet-ai manifest verify "$sha2" >/dev/null
-
 git checkout -f -- big.bin
 
 size_b="$(stat -c%s big.bin)"

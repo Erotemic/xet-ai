@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::fs::File;
 use std::io::{Read, Write};
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -443,6 +443,104 @@ pub fn verify_manifest_local(local_cas_root: &Path, manifest: &Manifest) -> Resu
     Ok(summary)
 }
 
+pub fn is_sha1_hex(s: &str) -> bool {
+    s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+pub fn resolve_ref_or_sha(remote_repo_root: &Path, input: Option<&str>) -> Result<String> {
+    match input {
+        None => read_head(&remote_repo_root.join("manifests").join("HEAD")),
+        Some(v) if is_sha1_hex(v) => Ok(v.to_string()),
+        Some(refname) => {
+            let ref_path = remote_repo_root.join("refs").join(refname);
+            let content = fs::read_to_string(&ref_path)
+                .with_context(|| format!("remote ref not found: {}", ref_path.display()))?;
+            let sha = content.trim();
+            if !is_sha1_hex(sha) {
+                bail!("remote ref {} does not resolve to a valid SHA", refname);
+            }
+            Ok(sha.to_string())
+        }
+    }
+}
+
+pub fn list_remote_refs(remote_repo_root: &Path) -> Result<Vec<(String, String)>> {
+    let refs_root = remote_repo_root.join("refs");
+    if !refs_root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for entry in WalkDir::new(&refs_root).into_iter().filter_map(|e| e.ok()) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let rel = entry.path().strip_prefix(&refs_root)?;
+        let name = rel.to_string_lossy().to_string();
+        let sha = fs::read_to_string(entry.path())?.trim().to_string();
+        out.push((name, sha));
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
+}
+
+pub struct PushLockGuard {
+    lock_path: PathBuf,
+}
+
+impl Drop for PushLockGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.lock_path);
+    }
+}
+
+pub fn acquire_push_lock(remote_repo_root: &Path, force_lock: bool) -> Result<PushLockGuard> {
+    let lock_path = remote_repo_root.join("locks").join("push.lock");
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let stale_secs = 30 * 60;
+    if lock_path.exists() {
+        let meta = fs::metadata(&lock_path)?;
+        let stale = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .map(|d| d.as_secs() > stale_secs)
+            .unwrap_or(false);
+
+        if force_lock || stale {
+            eprintln!(
+                "warning: breaking existing push lock at {}",
+                lock_path.display()
+            );
+            let _ = fs::remove_file(&lock_path);
+        } else {
+            bail!(
+                "another push appears to be in progress; lock exists at {}",
+                lock_path.display()
+            );
+        }
+    }
+
+    let mut f = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("failed to acquire push lock at {}", lock_path.display()))?;
+
+    let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown-host".to_string());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    writeln!(f, "pid={}", std::process::id())?;
+    writeln!(f, "host={}", host)?;
+    writeln!(f, "unix_ts={}", now)?;
+
+    Ok(PushLockGuard { lock_path })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,6 +586,43 @@ mod tests {
             .expect("manifest build 2 failed");
         assert_eq!(h2.calls, 0);
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolve_ref_or_sha_works() {
+        let root = std::env::temp_dir().join(format!("xet-ai-ref-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join("refs")).expect("create refs");
+        fs::create_dir_all(root.join("manifests")).expect("create manifests");
+
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        fs::write(root.join("refs/main"), format!("{}\n", sha)).expect("write ref");
+        fs::write(root.join("manifests/HEAD"), format!("{}\n", sha)).expect("write head");
+
+        assert_eq!(
+            resolve_ref_or_sha(&root, Some(sha)).expect("sha resolve"),
+            sha
+        );
+        assert_eq!(
+            resolve_ref_or_sha(&root, Some("main")).expect("ref resolve"),
+            sha
+        );
+        assert_eq!(resolve_ref_or_sha(&root, None).expect("head resolve"), sha);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn lock_acquire_release() {
+        let root = std::env::temp_dir().join(format!("xet-ai-lock-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create root");
+
+        {
+            let _guard = acquire_push_lock(&root, false).expect("acquire lock");
+            assert!(root.join("locks/push.lock").exists());
+        }
+
+        assert!(!root.join("locks/push.lock").exists());
         let _ = fs::remove_dir_all(root);
     }
 }

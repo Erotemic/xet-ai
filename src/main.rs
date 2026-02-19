@@ -10,7 +10,7 @@ use std::sync::{Arc, OnceLock};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
-use config::AppConfig;
+use config::{ConfigFile, EffectiveConfig};
 use data::configurations::TranslatorConfig;
 use data::{FileDownloader, FileUploadSession, XetFileInfo};
 use file_reconstruction::DataOutput;
@@ -26,7 +26,10 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    Init,
+    Init {
+        #[arg(long)]
+        init_config: bool,
+    },
     Clean {
         #[arg(long)]
         path: Option<PathBuf>,
@@ -36,10 +39,14 @@ enum Commands {
         path: Option<PathBuf>,
     },
     Push {
-        name: String,
+        name: Option<String>,
+        #[arg(long = "ref")]
+        refname: Option<String>,
+        #[arg(long)]
+        force_lock: bool,
     },
     Pull {
-        name: String,
+        name: Option<String>,
         #[arg(long = "ref")]
         git_ref: Option<String>,
     },
@@ -59,8 +66,24 @@ enum Commands {
 
 #[derive(Subcommand, Debug)]
 enum RemoteCommands {
-    Add { name: String, path: PathBuf },
+    Add {
+        name: String,
+        path: PathBuf,
+        #[arg(long)]
+        local: bool,
+    },
     List,
+    SetDefault {
+        name: String,
+        #[arg(long)]
+        local: bool,
+    },
+    Refs {
+        remote: Option<String>,
+    },
+    Head {
+        remote: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -99,14 +122,21 @@ fn main() {
 async fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Init => init(),
+        Commands::Init { init_config } => init(init_config),
         Commands::Clean { path } => clean(path).await,
         Commands::Smudge { path } => smudge(path).await,
-        Commands::Push { name } => push(&name),
-        Commands::Pull { name, git_ref } => pull(&name, git_ref.as_deref()),
+        Commands::Push {
+            name,
+            refname,
+            force_lock,
+        } => push(name.as_deref(), refname.as_deref(), force_lock),
+        Commands::Pull { name, git_ref } => pull(name.as_deref(), git_ref.as_deref(), true),
         Commands::Remote { command } => match command {
-            RemoteCommands::Add { name, path } => remote_add(&name, &path),
+            RemoteCommands::Add { name, path, local } => remote_add(&name, &path, local),
             RemoteCommands::List => remote_list(),
+            RemoteCommands::SetDefault { name, local } => remote_set_default(&name, local),
+            RemoteCommands::Refs { remote } => remote_refs(remote.as_deref()),
+            RemoteCommands::Head { remote } => remote_head(remote.as_deref()),
         },
         Commands::Debug { command } => match command {
             DebugCommands::CasTree => debug_cas_tree(),
@@ -119,7 +149,7 @@ async fn run() -> Result<()> {
     }
 }
 
-fn init() -> Result<()> {
+fn init(init_config: bool) -> Result<()> {
     let repo_root = repo::repo_root()?;
     let xet_ai_dir = repo_root.join(".xet_ai");
     fs::create_dir_all(&xet_ai_dir)?;
@@ -143,6 +173,17 @@ fn init() -> Result<()> {
             "created {} with repo id {repo_id}; please commit this file so clones share the same identity.",
             repo::REPO_ID_FILE
         );
+    }
+
+    if init_config {
+        let shared = config::shared_config_path(&repo_root);
+        if !shared.exists() {
+            config::save_shared(&repo_root, &ConfigFile::default())?;
+            eprintln!(
+                "created {}; commit if you want shared remote config",
+                shared.display()
+            );
+        }
     }
 
     Ok(())
@@ -241,6 +282,41 @@ async fn smudge(path: Option<PathBuf>) -> Result<()> {
         Err(e) => {
             let msg = e.to_string().to_lowercase();
             if msg.contains("not found") || msg.contains("no such") || msg.contains("missing") {
+                let effective = EffectiveConfig::load(&repo_root)?;
+                let already_attempted = std::env::var("XET_AI_SMUDGE_AUTOPULL_ATTEMPT")
+                    .ok()
+                    .as_deref()
+                    == Some("1");
+
+                if effective.auto_pull_on_smudge && !already_attempted {
+                    if let Some(remote) = effective.default_remote {
+                        std::env::set_var("XET_AI_SMUDGE_AUTOPULL_ATTEMPT", "1");
+                        let pulled = pull(Some(&remote), None, false).is_ok();
+                        std::env::remove_var("XET_AI_SMUDGE_AUTOPULL_ATTEMPT");
+
+                        if pulled {
+                            let cfg2 = Arc::new(TranslatorConfig::local_config(
+                                repo_root.join(".xet_ai"),
+                            )?);
+                            let downloader2 = FileDownloader::new(cfg2).await?;
+                            let output2 = DataOutput::writer(io::stdout());
+                            if downloader2
+                                .smudge_file_from_hash(
+                                    &hash,
+                                    file_label.clone(),
+                                    output2,
+                                    None,
+                                    None,
+                                )
+                                .await
+                                .is_ok()
+                            {
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+
                 eprintln!(
                     "warning: missing CAS data; run `xet-ai pull <remote>` then `git checkout -f -- {}`",
                     file_label
@@ -272,6 +348,21 @@ fn manifest_dir(repo_root: &Path) -> PathBuf {
 
 fn manifest_path(repo_root: &Path, sha: &str) -> PathBuf {
     manifest_dir(repo_root).join(format!("{sha}.json"))
+}
+
+fn resolve_remote_name(input: Option<&str>, effective: &EffectiveConfig) -> Result<String> {
+    if let Some(name) = input {
+        return Ok(name.to_string());
+    }
+    effective
+        .default_remote
+        .clone()
+        .ok_or_else(|| anyhow!("no remote specified and no default_remote configured"))
+}
+
+fn remote_repo_root(repo_root: &Path, remote: &config::RemoteConfig) -> Result<PathBuf> {
+    let repo_id = repo::load_repo_id(repo_root)?;
+    Ok(repo::resolve_path(repo_root, &remote.path).join(repo_id))
 }
 
 fn manifest_list() -> Result<()> {
@@ -336,9 +427,13 @@ fn manifest_verify(sha: &str) -> Result<()> {
     Ok(())
 }
 
-fn remote_add(name: &str, path: &Path) -> Result<()> {
+fn remote_add(name: &str, path: &Path, local: bool) -> Result<()> {
     let repo_root = repo::repo_root()?;
-    let mut cfg = AppConfig::load(&repo_root)?;
+    let mut cfg = if local {
+        config::load_local(&repo_root)?
+    } else {
+        config::load_shared(&repo_root)?
+    };
     cfg.remotes.insert(
         name.to_string(),
         config::RemoteConfig {
@@ -346,24 +441,80 @@ fn remote_add(name: &str, path: &Path) -> Result<()> {
             path: path.to_path_buf(),
         },
     );
-    cfg.save(&repo_root)
+
+    if local {
+        config::save_local(&repo_root, &cfg)
+    } else {
+        config::save_shared(&repo_root, &cfg)
+    }
+}
+
+fn remote_set_default(name: &str, local: bool) -> Result<()> {
+    let repo_root = repo::repo_root()?;
+    let eff = EffectiveConfig::load(&repo_root)?;
+    if !eff.remotes.contains_key(name) {
+        bail!("remote `{name}` does not exist in effective config");
+    }
+
+    let mut cfg = if local {
+        config::load_local(&repo_root)?
+    } else {
+        config::load_shared(&repo_root)?
+    };
+    cfg.default_remote = Some(name.to_string());
+
+    if local {
+        config::save_local(&repo_root, &cfg)
+    } else {
+        config::save_shared(&repo_root, &cfg)
+    }
 }
 
 fn remote_list() -> Result<()> {
     let repo_root = repo::repo_root()?;
-    let cfg = AppConfig::load(&repo_root)?;
+    let cfg = EffectiveConfig::load(&repo_root)?;
     for (name, remote) in cfg.remotes {
         println!("{name}\t{}\t{}", remote.r#type, remote.path.display());
     }
     Ok(())
 }
 
-fn push(name: &str) -> Result<()> {
+fn remote_refs(remote_name: Option<&str>) -> Result<()> {
     let repo_root = repo::repo_root()?;
-    let cfg = AppConfig::load(&repo_root)?;
+    let cfg = EffectiveConfig::load(&repo_root)?;
+    let name = resolve_remote_name(remote_name, &cfg)?;
     let remote = cfg
         .remotes
-        .get(name)
+        .get(&name)
+        .with_context(|| format!("remote `{name}` not found"))?;
+    let root = remote_repo_root(&repo_root, remote)?;
+    for (refname, sha) in sync::list_remote_refs(&root)? {
+        println!("{refname}\t{sha}");
+    }
+    Ok(())
+}
+
+fn remote_head(remote_name: Option<&str>) -> Result<()> {
+    let repo_root = repo::repo_root()?;
+    let cfg = EffectiveConfig::load(&repo_root)?;
+    let name = resolve_remote_name(remote_name, &cfg)?;
+    let remote = cfg
+        .remotes
+        .get(&name)
+        .with_context(|| format!("remote `{name}` not found"))?;
+    let root = remote_repo_root(&repo_root, remote)?;
+    let sha = sync::read_head(&root.join("manifests").join("HEAD"))?;
+    println!("{sha}");
+    Ok(())
+}
+
+fn push(remote_name: Option<&str>, refname_opt: Option<&str>, force_lock: bool) -> Result<()> {
+    let repo_root = repo::repo_root()?;
+    let cfg = EffectiveConfig::load(&repo_root)?;
+    let name = resolve_remote_name(remote_name, &cfg)?;
+    let remote = cfg
+        .remotes
+        .get(&name)
         .with_context(|| format!("remote `{name}` not found"))?;
     if remote.r#type != "filesystem" {
         bail!("unsupported remote type `{}`", remote.r#type);
@@ -375,6 +526,8 @@ fn push(name: &str) -> Result<()> {
     let local_cas_root = xet_ai_root.join("xet");
 
     let remote_repo_root = repo::resolve_path(&repo_root, &remote.path).join(&repo_id);
+    let _lock_guard = sync::acquire_push_lock(&remote_repo_root, force_lock)?;
+
     let remote_cas_root = remote_repo_root.join("xet");
     let remote_manifest_dir = remote_repo_root.join("manifests");
 
@@ -390,6 +543,15 @@ fn push(name: &str) -> Result<()> {
     let head_path = remote_manifest_dir.join("HEAD");
     sync::write_head_atomic(&head_path, &git_sha)?;
 
+    let refname = refname_opt
+        .map(|s| s.to_string())
+        .or_else(|| repo::git_current_branch_short(&repo_root).ok().flatten())
+        .unwrap_or_else(|| "HEAD".to_string());
+    sync::atomic_write_string(
+        &remote_repo_root.join("refs").join(&refname),
+        &format!("{git_sha}\n"),
+    )?;
+
     println!(
         "copied {} files ({} bytes)",
         summary.files_copied, summary.bytes_copied
@@ -404,28 +566,24 @@ fn push(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn pull(name: &str, git_ref: Option<&str>) -> Result<()> {
+fn pull(remote_name: Option<&str>, git_ref: Option<&str>, verbose: bool) -> Result<()> {
     let repo_root = repo::repo_root()?;
-    let cfg = AppConfig::load(&repo_root)?;
+    let cfg = EffectiveConfig::load(&repo_root)?;
+    let name = resolve_remote_name(remote_name, &cfg)?;
     let remote = cfg
         .remotes
-        .get(name)
+        .get(&name)
         .with_context(|| format!("remote `{name}` not found"))?;
     if remote.r#type != "filesystem" {
         bail!("unsupported remote type `{}`", remote.r#type);
     }
 
-    let repo_id = repo::load_repo_id(&repo_root)?;
-    let remote_repo_root = repo::resolve_path(&repo_root, &remote.path).join(&repo_id);
-    let remote_manifest_dir = remote_repo_root.join("manifests");
+    let remote_repo_root = remote_repo_root(&repo_root, remote)?;
+    let sha = sync::resolve_ref_or_sha(&remote_repo_root, git_ref)?;
 
-    let sha = if let Some(r) = git_ref {
-        r.to_string()
-    } else {
-        sync::read_head(&remote_manifest_dir.join("HEAD"))?
-    };
-
-    let remote_manifest_path = remote_manifest_dir.join(format!("{sha}.json"));
+    let remote_manifest_path = remote_repo_root
+        .join("manifests")
+        .join(format!("{sha}.json"));
     let manifest = sync::read_manifest(&remote_manifest_path)?;
 
     let local_manifest_path = manifest_path(&repo_root, &sha);
@@ -435,15 +593,17 @@ fn pull(name: &str, git_ref: Option<&str>) -> Result<()> {
     let remote_cas_root = remote_repo_root.join("xet");
     let summary = sync::pull_from_manifest(&remote_cas_root, &local_cas_root, &manifest)?;
 
-    println!(
-        "pulled manifest {} ({})",
-        sha,
-        local_manifest_path.display()
-    );
-    println!(
-        "copied {} files ({} bytes)",
-        summary.files_copied, summary.bytes_copied
-    );
-    println!("verified {} files", summary.files_verified);
+    if verbose {
+        println!(
+            "pulled manifest {} ({})",
+            sha,
+            local_manifest_path.display()
+        );
+        println!(
+            "copied {} files ({} bytes)",
+            summary.files_copied, summary.bytes_copied
+        );
+        println!("verified {} files", summary.files_verified);
+    }
     Ok(())
 }
