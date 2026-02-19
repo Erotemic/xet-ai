@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "crates/xet_ai_core"]
+
 [package]
 name = "xet-ai"
 version = "0.1.0"
@@ -8,10 +11,12 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
-serde_json = "1"
 walkdir = "2"
-uuid = { version = "1", features = ["v4"] }
 sha2 = "0.10"
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+
+xet_ai_core = { path = "crates/xet_ai_core" }
 
 # xet-core local CAS implementation pinned to specific revision
 data = { package = "data", git = "https://github.com/huggingface/xet-core", rev = "a7661a7e63626466561e88e63113001a193a36ee" }
