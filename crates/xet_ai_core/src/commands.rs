@@ -58,6 +58,18 @@ fn fs_remote_store(
     Ok(FilesystemRemoteStore::new(root))
 }
 
+pub fn should_attempt_smudge_autopull(repo_root: &Path) -> Result<Option<String>> {
+    let effective = EffectiveConfig::load(repo_root)?;
+    let already_attempted = std::env::var("XET_AI_SMUDGE_AUTOPULL_ATTEMPT")
+        .ok()
+        .as_deref()
+        == Some("1");
+    if effective.auto_pull_on_smudge && !already_attempted {
+        return Ok(effective.default_remote);
+    }
+    Ok(None)
+}
+
 fn choose_representative_pointer(idx: &PointerIndex) -> Option<XetFileInfo> {
     let mut entries = idx.entries.clone();
     entries.sort_by_key(|e| {
@@ -70,6 +82,14 @@ fn choose_representative_pointer(idx: &PointerIndex) -> Option<XetFileInfo> {
     entries.first().map(|e| e.file_info.clone())
 }
 
+fn new_validation_base(repo_root: &Path, sha: &str) -> PathBuf {
+    repo_root
+        .join(".xet_ai")
+        .join("validate")
+        .join(sha)
+        .join(Uuid::new_v4().to_string())
+}
+
 async fn validate_minimal_plan(
     repo_root: &Path,
     sha: &str,
@@ -80,7 +100,7 @@ async fn validate_minimal_plan(
         return Ok(true);
     };
 
-    let val_base = repo_root.join(".xet_ai").join("validate").join(sha);
+    let val_base = new_validation_base(repo_root, sha);
     let val_cas = val_base.join("xet");
     let local_cas = repo_root.join(".xet_ai").join("xet");
     fs::create_dir_all(&val_cas)?;
@@ -318,23 +338,78 @@ pub fn remote_tx_list(remote_name: Option<&str>) -> Result<()> {
         .with_context(|| format!("remote `{name}` not found"))?;
     let repo_id = repo::load_repo_id(&repo_root)?;
     let store = fs_remote_store(&repo_root, remote, &repo_id)?;
+    if !store.capabilities().supports_list_prefix {
+        bail!("remote backend does not support transaction listing");
+    }
     let mut txids = store
         .list_prefix("tx")?
         .into_iter()
         .filter_map(|p| p.strip_prefix("tx/").map(str::to_string))
-        .filter(|p| !p.starts_with("COMMITTED/"))
+        .filter(|p| !p.starts_with("STAGED/") && !p.starts_with("PUBLISHED/"))
         .filter_map(|p| p.split('/').next().map(str::to_string))
         .collect::<Vec<_>>();
     txids.sort();
     txids.dedup();
     for txid in txids {
-        let committed = store.exists(&format!("tx/COMMITTED/{txid}"))?;
-        println!(
-            "{}\t{}",
-            txid,
-            if committed { "committed" } else { "staged" }
-        );
+        let published = store.exists(&format!("tx/PUBLISHED/{txid}"))?;
+        let staged = store.exists(&format!("tx/STAGED/{txid}"))?;
+        let state = if published {
+            "published"
+        } else if staged {
+            "staged"
+        } else {
+            "unknown"
+        };
+        println!("{}\t{}", txid, state);
     }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct TransactionArtifacts {
+    txid: String,
+    git_sha: String,
+    refname: String,
+    manifest_json: Vec<u8>,
+    pointer_json: Vec<u8>,
+}
+
+fn stage_transaction(store: &dyn RemoteStore, tx: &TransactionArtifacts) -> Result<()> {
+    let tx_base = format!("tx/{}", tx.txid);
+    store.write_bytes_atomic(
+        &format!("{tx_base}/manifests/{}.json", tx.git_sha),
+        &tx.manifest_json,
+    )?;
+    store.write_bytes_atomic(
+        &format!("{tx_base}/pointers/{}.json", tx.git_sha),
+        &tx.pointer_json,
+    )?;
+    store.write_bytes_atomic(
+        &format!("{tx_base}/refs/{}", tx.refname),
+        format!("{}\n", tx.git_sha).as_bytes(),
+    )?;
+    store.write_bytes_atomic(
+        &format!("{tx_base}/manifests/HEAD"),
+        format!("{}\n", tx.git_sha).as_bytes(),
+    )?;
+    store.write_bytes_atomic(
+        &format!("{tx_base}/pointers/HEAD"),
+        format!("{}\n", tx.git_sha).as_bytes(),
+    )?;
+    store.write_bytes_atomic(&format!("tx/STAGED/{}", tx.txid), b"staged\n")?;
+    Ok(())
+}
+
+fn finalize_transaction(store: &dyn RemoteStore, tx: &TransactionArtifacts) -> Result<()> {
+    store.write_bytes_atomic(&format!("manifests/{}.json", tx.git_sha), &tx.manifest_json)?;
+    store.write_bytes_atomic(&format!("pointers/{}.json", tx.git_sha), &tx.pointer_json)?;
+    store.write_bytes_atomic(
+        &format!("refs/{}", tx.refname),
+        format!("{}\n", tx.git_sha).as_bytes(),
+    )?;
+    store.write_bytes_atomic("manifests/HEAD", format!("{}\n", tx.git_sha).as_bytes())?;
+    store.write_bytes_atomic("pointers/HEAD", format!("{}\n", tx.git_sha).as_bytes())?;
+    store.write_bytes_atomic(&format!("tx/PUBLISHED/{}", tx.txid), b"published\n")?;
     Ok(())
 }
 
@@ -359,6 +434,10 @@ pub async fn push(
     let hash_cache_path = xet_ai_root.join("hash_cache.json");
 
     let store = fs_remote_store(&repo_root, remote, &repo_id)?;
+    let caps = store.capabilities();
+    if !caps.supports_locking {
+        bail!("remote backend does not support push locking");
+    }
     let _lock_guard = sync::acquire_push_lock(store.root(), force_lock)?;
 
     let pointer_index = reachability::load_or_build_pointer_index(&repo_root, &git_sha, &repo_id)?;
@@ -416,38 +495,16 @@ pub async fn push(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let txid = format!("{}.{}.{}", git_sha, ts, Uuid::new_v4());
-    let tx_base = format!("tx/{txid}");
+    let tx = TransactionArtifacts {
+        txid: format!("{}.{}.{}", git_sha, ts, Uuid::new_v4()),
+        git_sha: git_sha.clone(),
+        refname: refname.clone(),
+        manifest_json: serde_json::to_vec_pretty(&manifest)?,
+        pointer_json: serde_json::to_vec_pretty(&pointer_index)?,
+    };
 
-    let manifest_json = serde_json::to_vec_pretty(&manifest)?;
-    let pointer_json = serde_json::to_vec_pretty(&pointer_index)?;
-    store.write_bytes_atomic(
-        &format!("{tx_base}/manifests/{git_sha}.json"),
-        &manifest_json,
-    )?;
-    store.write_bytes_atomic(&format!("{tx_base}/pointers/{git_sha}.json"), &pointer_json)?;
-    store.write_bytes_atomic(
-        &format!("{tx_base}/refs/{refname}"),
-        format!("{git_sha}\n").as_bytes(),
-    )?;
-    store.write_bytes_atomic(
-        &format!("{tx_base}/manifests/HEAD"),
-        format!("{git_sha}\n").as_bytes(),
-    )?;
-    store.write_bytes_atomic(
-        &format!("{tx_base}/pointers/HEAD"),
-        format!("{git_sha}\n").as_bytes(),
-    )?;
-    store.write_bytes_atomic(&format!("tx/COMMITTED/{txid}"), b"committed\n")?;
-
-    store.write_bytes_atomic(&format!("manifests/{git_sha}.json"), &manifest_json)?;
-    store.write_bytes_atomic(&format!("pointers/{git_sha}.json"), &pointer_json)?;
-    store.write_bytes_atomic(
-        &format!("refs/{refname}"),
-        format!("{git_sha}\n").as_bytes(),
-    )?;
-    store.write_bytes_atomic("manifests/HEAD", format!("{git_sha}\n").as_bytes())?;
-    store.write_bytes_atomic("pointers/HEAD", format!("{git_sha}\n").as_bytes())?;
+    stage_transaction(&store, &tx)?;
+    finalize_transaction(&store, &tx)?;
 
     println!(
         "copied {} files ({} bytes)",
@@ -506,6 +563,9 @@ pub fn pull(
     let hash_cache_path = repo_root.join(".xet_ai").join("hash_cache.json");
 
     let manifest = if all_cas {
+        if !store.capabilities().supports_list_prefix {
+            bail!("remote backend does not support --all-cas pull (list_prefix unavailable)");
+        }
         let remote_cas_root = store.root().join("xet");
         sync::build_manifest("all-cas", &sha, &remote_cas_root, &hash_cache_path)?
     } else {
@@ -540,4 +600,78 @@ pub fn pull(
         println!("verified {} files", summary.files_verified);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validation_base_is_unique() {
+        let root = std::env::temp_dir().join(format!("xet-ai-cmd-test-{}", Uuid::new_v4()));
+        let a = new_validation_base(&root, "sha");
+        let b = new_validation_base(&root, "sha");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn transaction_markers_reflect_publish_state() {
+        let root = std::env::temp_dir().join(format!("xet-ai-tx-test-{}", Uuid::new_v4()));
+        let store = FilesystemRemoteStore::new(root.clone());
+        let tx = TransactionArtifacts {
+            txid: "tx1".to_string(),
+            git_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            refname: "main".to_string(),
+            manifest_json: b"{}".to_vec(),
+            pointer_json: b"{}".to_vec(),
+        };
+
+        stage_transaction(&store, &tx).expect("stage");
+        assert!(store.exists("tx/STAGED/tx1").expect("staged marker"));
+        assert!(!store.exists("tx/PUBLISHED/tx1").expect("published marker"));
+        assert!(!store
+            .exists("refs/main")
+            .expect("live ref absent before finalize"));
+
+        finalize_transaction(&store, &tx).expect("finalize");
+        assert!(store
+            .exists("tx/PUBLISHED/tx1")
+            .expect("published marker after finalize"));
+        assert_eq!(
+            String::from_utf8(
+                store
+                    .read_bytes("refs/main")
+                    .expect("read refs")
+                    .expect("exists")
+            )
+            .expect("utf8")
+            .trim(),
+            tx.git_sha
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn smudge_autopull_guard_attempt_once() {
+        let root = std::env::temp_dir().join(format!("xet-ai-autopull-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("root");
+
+        let mut shared = ConfigFile::default();
+        shared.default_remote = Some("origin".to_string());
+        shared.auto_pull_on_smudge = Some(true);
+        config::save_shared(&root, &shared).expect("save shared");
+
+        std::env::remove_var("XET_AI_SMUDGE_AUTOPULL_ATTEMPT");
+        assert_eq!(
+            should_attempt_smudge_autopull(&root).expect("should"),
+            Some("origin".to_string())
+        );
+
+        std::env::set_var("XET_AI_SMUDGE_AUTOPULL_ATTEMPT", "1");
+        assert_eq!(should_attempt_smudge_autopull(&root).expect("guard"), None);
+        std::env::remove_var("XET_AI_SMUDGE_AUTOPULL_ATTEMPT");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

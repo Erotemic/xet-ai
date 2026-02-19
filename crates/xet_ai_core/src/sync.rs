@@ -15,6 +15,19 @@ use crate::remote::RemoteStore;
 pub const HASH_VERIFY_LIMIT: u64 = 8 * 1024 * 1024;
 const ALLOWLIST_TOP_LEVEL: &[&str] = &["cas", "shards", "mdb", "xorbs", "merkledb"];
 
+#[derive(Debug, Clone, Copy)]
+pub struct VerifyPolicy {
+    pub hash_verify_limit: u64,
+}
+
+impl Default for VerifyPolicy {
+    fn default() -> Self {
+        Self {
+            hash_verify_limit: HASH_VERIFY_LIMIT,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct SyncSummary {
     pub files_copied: u64,
@@ -468,23 +481,145 @@ pub fn pull_from_manifest(
     Ok(summary)
 }
 
+fn verify_existing(
+    path: &Path,
+    expected_size: u64,
+    expected_sha256: &str,
+    policy: VerifyPolicy,
+) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let size = fs::metadata(path)?.len();
+    if size != expected_size {
+        bail!(
+            "destination corruption detected: {} has size {}, expected {}",
+            path.display(),
+            size,
+            expected_size
+        );
+    }
+    if expected_size <= policy.hash_verify_limit {
+        let got = sha256_file(path)?;
+        if got != expected_sha256 {
+            bail!(
+                "destination hash mismatch: {} expected {} got {}",
+                path.display(),
+                expected_sha256,
+                got
+            );
+        }
+    }
+    Ok(())
+}
+
+fn verify_existing_remote(
+    remote_store: &dyn RemoteStore,
+    remote_relpath: &str,
+    expected_size: u64,
+    expected_sha256: &str,
+    policy: VerifyPolicy,
+) -> Result<bool> {
+    let Some(bytes) = remote_store.read_bytes(remote_relpath)? else {
+        return Ok(false);
+    };
+    let size = bytes.len() as u64;
+    if size != expected_size {
+        bail!(
+            "destination corruption detected: {} has size {}, expected {}",
+            remote_relpath,
+            size,
+            expected_size
+        );
+    }
+    if expected_size <= policy.hash_verify_limit {
+        let got = format!("{:x}", Sha256::digest(&bytes));
+        if got != expected_sha256 {
+            bail!(
+                "destination hash mismatch: {} expected {} got {}",
+                remote_relpath,
+                expected_sha256,
+                got
+            );
+        }
+    }
+    Ok(true)
+}
+
+pub fn copy_local_to_remote_atomic_verified(
+    local_path: &Path,
+    remote_store: &dyn RemoteStore,
+    remote_relpath: &str,
+    expected_size: u64,
+    expected_sha256: &str,
+    policy: VerifyPolicy,
+) -> Result<u64> {
+    if verify_existing_remote(
+        remote_store,
+        remote_relpath,
+        expected_size,
+        expected_sha256,
+        policy,
+    )? {
+        return Ok(0);
+    }
+
+    remote_store.copy_from_local_atomic(local_path, remote_relpath)?;
+
+    if !verify_existing_remote(
+        remote_store,
+        remote_relpath,
+        expected_size,
+        expected_sha256,
+        policy,
+    )? {
+        bail!("remote copy failed to materialize {}", remote_relpath);
+    }
+
+    Ok(expected_size)
+}
+
+pub fn copy_remote_to_local_atomic_verified(
+    remote_store: &dyn RemoteStore,
+    remote_relpath: &str,
+    local_path: &Path,
+    expected_size: u64,
+    expected_sha256: &str,
+    policy: VerifyPolicy,
+) -> Result<u64> {
+    verify_existing(local_path, expected_size, expected_sha256, policy)?;
+    if local_path.exists() {
+        return Ok(0);
+    }
+
+    remote_store.copy_to_local_atomic(remote_relpath, local_path)?;
+    verify_existing(local_path, expected_size, expected_sha256, policy)?;
+    Ok(expected_size)
+}
+
 pub fn push_with_manifest_store(
     local_cas_root: &Path,
     remote_store: &dyn RemoteStore,
     manifest: &Manifest,
 ) -> Result<SyncSummary> {
     let mut summary = SyncSummary::default();
+    let policy = VerifyPolicy::default();
 
     for entry in &manifest.entries {
         let src = local_cas_root.join(&entry.relpath);
         let remote_relpath = format!("xet/{}", entry.relpath);
-        if remote_store.exists(&remote_relpath)? {
-            summary.files_verified += 1;
-            continue;
+        let copied = copy_local_to_remote_atomic_verified(
+            &src,
+            remote_store,
+            &remote_relpath,
+            entry.size,
+            &entry.sha256,
+            policy,
+        )?;
+        if copied > 0 {
+            summary.files_copied += 1;
+            summary.bytes_copied += copied;
         }
-        remote_store.copy_from_local_atomic(&src, &remote_relpath)?;
-        summary.files_copied += 1;
-        summary.bytes_copied += entry.size;
         summary.files_verified += 1;
     }
 
@@ -497,6 +632,7 @@ pub fn pull_from_manifest_store(
     manifest: &Manifest,
 ) -> Result<SyncSummary> {
     let mut summary = SyncSummary::default();
+    let policy = VerifyPolicy::default();
 
     for entry in &manifest.entries {
         let remote_relpath = format!("xet/{}", entry.relpath);
@@ -508,13 +644,18 @@ pub fn pull_from_manifest_store(
         }
 
         let dst = local_cas_root.join(&entry.relpath);
-        if dst.exists() {
-            summary.files_verified += 1;
-            continue;
+        let copied = copy_remote_to_local_atomic_verified(
+            remote_store,
+            &remote_relpath,
+            &dst,
+            entry.size,
+            &entry.sha256,
+            policy,
+        )?;
+        if copied > 0 {
+            summary.files_copied += 1;
+            summary.bytes_copied += copied;
         }
-        remote_store.copy_to_local_atomic(&remote_relpath, &dst)?;
-        summary.files_copied += 1;
-        summary.bytes_copied += entry.size;
         summary.files_verified += 1;
     }
 
@@ -725,6 +866,79 @@ mod tests {
             sha
         );
         assert_eq!(resolve_ref_or_sha(&root, None).expect("head resolve"), sha);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn verified_copy_detects_remote_corruption() {
+        let root = std::env::temp_dir().join(format!("xet-ai-verify-{}", Uuid::new_v4()));
+        let local = root.join("local");
+        let remote = root.join("remote");
+        fs::create_dir_all(local.join("xet/cas")).expect("local dirs");
+        let local_file = local.join("xet/cas/a.bin");
+        fs::write(&local_file, b"hello").expect("write local");
+
+        let sha = sha256_file(&local_file).expect("hash");
+        let store = crate::remote::FilesystemRemoteStore::new(remote.clone());
+
+        copy_local_to_remote_atomic_verified(
+            &local_file,
+            &store,
+            "xet/cas/a.bin",
+            5,
+            &sha,
+            VerifyPolicy::default(),
+        )
+        .expect("copy");
+
+        fs::write(remote.join("xet/cas/a.bin"), b"helloo").expect("corrupt size");
+        let err = copy_local_to_remote_atomic_verified(
+            &local_file,
+            &store,
+            "xet/cas/a.bin",
+            5,
+            &sha,
+            VerifyPolicy::default(),
+        )
+        .expect_err("must fail on size mismatch");
+        assert!(err.to_string().contains("size"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn verified_copy_detects_small_file_hash_mismatch() {
+        let root = std::env::temp_dir().join(format!("xet-ai-verify-hash-{}", Uuid::new_v4()));
+        let local = root.join("local");
+        let remote = root.join("remote");
+        fs::create_dir_all(local.join("xet/cas")).expect("local dirs");
+        let local_file = local.join("xet/cas/a.bin");
+        fs::write(&local_file, b"hello").expect("write local");
+
+        let sha = sha256_file(&local_file).expect("hash");
+        let store = crate::remote::FilesystemRemoteStore::new(remote.clone());
+        copy_local_to_remote_atomic_verified(
+            &local_file,
+            &store,
+            "xet/cas/a.bin",
+            5,
+            &sha,
+            VerifyPolicy::default(),
+        )
+        .expect("copy");
+
+        fs::write(remote.join("xet/cas/a.bin"), b"jello").expect("corrupt content");
+        let err = copy_local_to_remote_atomic_verified(
+            &local_file,
+            &store,
+            "xet/cas/a.bin",
+            5,
+            &sha,
+            VerifyPolicy::default(),
+        )
+        .expect_err("must fail hash mismatch");
+        assert!(err.to_string().contains("hash"));
 
         let _ = fs::remove_dir_all(root);
     }

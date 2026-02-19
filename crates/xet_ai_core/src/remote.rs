@@ -6,7 +6,14 @@ use anyhow::{anyhow, Result};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
+#[derive(Debug, Clone, Copy)]
+pub struct RemoteCapabilities {
+    pub supports_locking: bool,
+    pub supports_list_prefix: bool,
+}
+
 pub trait RemoteStore {
+    fn capabilities(&self) -> RemoteCapabilities;
     fn read_bytes(&self, remote_relpath: &str) -> Result<Option<Vec<u8>>>;
     fn write_bytes_atomic(&self, remote_relpath: &str, bytes: &[u8]) -> Result<()>;
     fn exists(&self, remote_relpath: &str) -> Result<bool>;
@@ -52,8 +59,15 @@ fn atomic_write_bytes(dest: &Path, bytes: &[u8]) -> Result<()> {
         random_suffix()
     ));
 
-    fs::write(&tmp, bytes)?;
-    fs::rename(&tmp, dest)?;
+    let wr = fs::write(&tmp, bytes);
+    if let Err(e) = wr {
+        let _ = fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    if let Err(e) = fs::rename(&tmp, dest) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e.into());
+    }
     Ok(())
 }
 
@@ -70,12 +84,27 @@ fn copy_file_atomic(src: &Path, dst: &Path) -> Result<()> {
         random_suffix()
     ));
 
-    fs::copy(src, &tmp)?;
-    fs::rename(&tmp, dst)?;
+    let cp = fs::copy(src, &tmp);
+    if let Err(e) = cp {
+        let _ = fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+
+    if let Err(e) = fs::rename(&tmp, dst) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e.into());
+    }
     Ok(())
 }
 
 impl RemoteStore for FilesystemRemoteStore {
+    fn capabilities(&self) -> RemoteCapabilities {
+        RemoteCapabilities {
+            supports_locking: true,
+            supports_list_prefix: true,
+        }
+    }
+
     fn read_bytes(&self, remote_relpath: &str) -> Result<Option<Vec<u8>>> {
         let p = self.abs(remote_relpath);
         if !p.exists() {

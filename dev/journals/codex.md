@@ -221,3 +221,26 @@ This pass felt like finally crossing from "feature accumulation" to "system boun
 The validation-vs-performance tradeoff is still front of mind. I chose to prioritize correctness by validating minimal plans before publish, even though it adds local work. The fallback-to-all-cas behavior may look conservative, but it is the right safety rail while reachability remains heuristic. I’d rather absorb a temporary performance hit than risk publishing refs that cannot hydrate.
 
 Transactional publish sequencing also improved my confidence: writing staged artifacts and only moving live pointers at the end makes crash behavior significantly less scary. I still think we should eventually add explicit transaction GC and richer telemetry so operators can inspect long-lived staged directories, but the current shape already reduces partial-state risk in a tangible way.
+
+## 2026-02-19 (commit: pending) — Robustness recovery: verified copies, tx semantics, autopull guard
+
+### What changed
+- Restored verified/immutable transfer semantics in core store sync paths:
+  - added `VerifyPolicy` and verified copy helpers for local<->remote transfers.
+  - push/pull store-based sync now verifies size always and hash for small files.
+  - existing-destination mismatch is treated as corruption error.
+- Fixed transaction marker semantics:
+  - `tx/STAGED/<txid>` written after staging artifacts,
+  - `tx/PUBLISHED/<txid>` written only after live finalize updates complete.
+- Refactored transaction code into explicit `stage_transaction` + `finalize_transaction` helpers and added tests for staged-vs-published behavior and ref immutability before finalize.
+- Fixed validation workspace hygiene by using unique run-scoped validation directories under `.xet_ai/validate/<sha>/<uuid>/`.
+- Reintroduced smudge auto-pull behavior (attempt-once guarded via env var) by routing through core pull API helper.
+- Added explicit remote capability surface (`RemoteCapabilities`) and capability gating for tx listing / list-prefix flows.
+- Added unit tests for transfer corruption detection (size and hash mismatch), transaction marker semantics, validation dir uniqueness, and smudge autopull recursion guard behavior.
+
+### State of mind / reflections
+This sprint felt like paying down “accidental risk debt” introduced by a fast architecture move. The most uncomfortable part was acknowledging that the system got cleaner structurally while becoming less robust in data integrity paths. Reintroducing verification forced me to rebalance abstractions: the `RemoteStore` trait now stays backend-oriented while correctness checks live in sync orchestration, where manifest metadata is available and policy is explicit.
+
+The transaction marker fix was also a good reminder that naming carries operational meaning. Calling something “committed” too early is worse than no marker because it can mislead debugging and automation. Splitting staged/published states made semantics clearer and made tests much easier to reason about.
+
+I still see brittle edges: validation currently hydrates a representative pointer, which is safer than no validation but still probabilistic relative to full commit coverage. The current fallback strategy contains blast radius, but future work should improve planner fidelity and validation breadth without tanking UX. Even with those tradeoffs, this revision feels notably more trustworthy than the previous one.

@@ -272,6 +272,25 @@ async fn smudge(path: Option<PathBuf>) -> Result<()> {
         Err(e) => {
             let msg = e.to_string().to_lowercase();
             if msg.contains("not found") || msg.contains("no such") || msg.contains("missing") {
+                if let Some(remote) = commands::should_attempt_smudge_autopull(&repo_root)? {
+                    std::env::set_var("XET_AI_SMUDGE_AUTOPULL_ATTEMPT", "1");
+                    let pulled = commands::pull(Some(&remote), None, false, false).is_ok();
+                    std::env::remove_var("XET_AI_SMUDGE_AUTOPULL_ATTEMPT");
+                    if pulled {
+                        let cfg2 =
+                            Arc::new(TranslatorConfig::local_config(repo_root.join(".xet_ai"))?);
+                        let downloader2 = FileDownloader::new(cfg2).await?;
+                        let output2 = DataOutput::writer(io::stdout());
+                        if downloader2
+                            .smudge_file_from_hash(&hash, file_label.clone(), output2, None, None)
+                            .await
+                            .is_ok()
+                        {
+                            return Ok(());
+                        }
+                    }
+                }
+
                 eprintln!(
                     "warning: missing CAS data; run `xet-ai pull <remote>` then `git checkout -f -- {}`",
                     file_label
