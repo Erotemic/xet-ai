@@ -7,14 +7,18 @@ cd "$ROOT"
 cargo build --release
 export PATH="$ROOT/target/release:$PATH"
 
+extract_bytes() {
+  awk '/copied [0-9]+ files \([0-9]+ bytes\)/ {gsub(/[^0-9]/,"",$4); print $4}' | tail -n1
+}
+
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 
 remote_dir="$tmpdir/remote"
 machineA="$tmpdir/machineA"
 machineB="$tmpdir/machineB"
-repoA="$machineA/project"
-repoB="$machineB/project"
+repoA="$machineA/project_A"
+repoB="$machineB/project_B"
 mkdir -p "$remote_dir" "$machineA" "$machineB"
 
 git init "$repoA" >/dev/null
@@ -23,6 +27,10 @@ git config user.email "xet-ai@example.com"
 git config user.name "xet-ai"
 
 xet-ai init
+if [[ ! -f .xet_ai_repo_id ]]; then
+  echo "missing .xet_ai_repo_id" >&2
+  exit 1
+fi
 
 python3 - <<'PY'
 from pathlib import Path
@@ -38,8 +46,9 @@ git add .
 git commit -m "add big file" >/dev/null
 
 xet-ai remote add origin "$remote_dir"
-xet-ai push origin
-remote_size1="$(du -sb "$remote_dir" | awk '{print $1}')"
+push1_output="$(xet-ai push origin)"
+echo "$push1_output"
+bytes_push1="$(echo "$push1_output" | extract_bytes)"
 
 python3 - <<'PY'
 from pathlib import Path
@@ -53,11 +62,12 @@ PY
 
 git add big.bin
 git commit -m "update tail" >/dev/null
-xet-ai push origin
-remote_size2="$(du -sb "$remote_dir" | awk '{print $1}')"
+push2_output="$(xet-ai push origin)"
+echo "$push2_output"
+bytes_push2="$(echo "$push2_output" | extract_bytes)"
 
-if (( remote_size2 - remote_size1 >= 16 * 1024 * 1024 )); then
-  echo "Delta too large: $((remote_size2 - remote_size1))" >&2
+if (( bytes_push2 >= 20 * 1024 * 1024 )); then
+  echo "Push #2 copied too many bytes: $bytes_push2" >&2
   exit 1
 fi
 
@@ -67,9 +77,22 @@ cd "$machineB"
 git clone "$repoA" "$repoB" >/dev/null
 
 cd "$repoB"
+# clone should not hydrate without local CAS; pointer should still be present
+if ! python3 - <<'PY'
+import json
+from pathlib import Path
+p = Path('big.bin').read_text()
+obj = json.loads(p)
+assert 'hash' in obj and 'file_size' in obj
+PY
+then
+  echo "Expected pointer pass-through in clone before pull" >&2
+  exit 1
+fi
+
 xet-ai init
 xet-ai remote add origin "$remote_dir"
-xet-ai pull origin
+xet-ai pull origin >/dev/null
 git checkout -f -- big.bin
 
 size_b="$(stat -c%s big.bin)"

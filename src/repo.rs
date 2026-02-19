@@ -4,6 +4,8 @@ use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 
+pub const REPO_ID_FILE: &str = ".xet_ai_repo_id";
+
 pub fn repo_root() -> Result<PathBuf> {
     let output = Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
@@ -51,4 +53,18 @@ pub fn resolve_path(repo_root: &Path, path: &Path) -> PathBuf {
     } else {
         repo_root.join(path)
     }
+}
+
+pub fn repo_id_path(repo_root: &Path) -> PathBuf {
+    repo_root.join(REPO_ID_FILE)
+}
+
+pub fn load_repo_id(repo_root: &Path) -> Result<String> {
+    let id = fs::read_to_string(repo_id_path(repo_root))
+        .with_context(|| format!("missing {}; run `xet-ai init`", REPO_ID_FILE))?;
+    let trimmed = id.trim();
+    if trimmed.is_empty() {
+        bail!("{} is empty", REPO_ID_FILE);
+    }
+    Ok(trimmed.to_string())
 }

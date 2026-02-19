@@ -10,8 +10,9 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 serde_json = "1"
 walkdir = "2"
+uuid = { version = "1", features = ["v4"] }
 
-# xet-core local CAS implementation
-data = { git = "https://github.com/huggingface/xet-core", package = "data", branch = "main" }
-file_reconstruction = { git = "https://github.com/huggingface/xet-core", package = "file_reconstruction", branch = "main" }
-xet_runtime = { git = "https://github.com/huggingface/xet-core", package = "xet_runtime", branch = "main" }
+# xet-core local CAS implementation pinned to specific revision
+data = { package = "data", git = "https://github.com/huggingface/xet-core", rev = "a7661a7e63626466561e88e63113001a193a36ee" }
+file_reconstruction = { package = "file_reconstruction", git = "https://github.com/huggingface/xet-core", rev = "a7661a7e63626466561e88e63113001a193a36ee" }
+xet_runtime = { package = "xet_runtime", git = "https://github.com/huggingface/xet-core", rev = "a7661a7e63626466561e88e63113001a193a36ee" }
