@@ -11,6 +11,7 @@ toml = "0.8"
 serde_json = "1"
 walkdir = "2"
 uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
 
 # xet-core local CAS implementation pinned to specific revision
 data = { package = "data", git = "https://github.com/huggingface/xet-core", rev = "a7661a7e63626466561e88e63113001a193a36ee" }

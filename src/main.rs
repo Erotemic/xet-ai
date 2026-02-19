@@ -28,17 +28,19 @@ enum Commands {
     Init,
     Clean {
         #[arg(long)]
-        path: PathBuf,
+        path: Option<PathBuf>,
     },
     Smudge {
         #[arg(long)]
-        path: PathBuf,
+        path: Option<PathBuf>,
     },
     Push {
         name: String,
     },
     Pull {
         name: String,
+        #[arg(long = "ref")]
+        git_ref: Option<String>,
     },
     Remote {
         #[command(subcommand)]
@@ -89,7 +91,7 @@ async fn run() -> Result<()> {
         Commands::Clean { path } => clean(path).await,
         Commands::Smudge { path } => smudge(path).await,
         Commands::Push { name } => push(&name),
-        Commands::Pull { name } => pull(&name),
+        Commands::Pull { name, git_ref } => pull(&name, git_ref.as_deref()),
         Commands::Remote { command } => match command {
             RemoteCommands::Add { name, path } => remote_add(&name, &path),
             RemoteCommands::List => remote_list(),
@@ -129,43 +131,62 @@ fn init() -> Result<()> {
     Ok(())
 }
 
-async fn clean(path: PathBuf) -> Result<()> {
+async fn clean(path: Option<PathBuf>) -> Result<()> {
     let repo_root = repo::repo_root()?;
     let base = repo_root.join(".xet_ai");
     fs::create_dir_all(&base)?;
 
-    let cfg = Arc::new(TranslatorConfig::local_config(base)?);
-    let full_path = repo::resolve_path(&repo_root, &path);
+    let cfg = Arc::new(TranslatorConfig::local_config(base.clone())?);
 
-    let (mut reader, size): (Box<dyn Read + Send>, u64) = if full_path.exists() {
-        let file = fs::File::open(&full_path)?;
-        let size = file.metadata()?.len();
-        (Box::new(file), size)
-    } else {
-        let mut stdin_buf = Vec::new();
-        io::stdin().read_to_end(&mut stdin_buf)?;
-        let size = stdin_buf.len() as u64;
-        (Box::new(io::Cursor::new(stdin_buf)), size)
-    };
+    let source_path = prepare_clean_source(&repo_root, &base, path)?;
+    let source_size = fs::metadata(&source_path)?.len();
 
     let session = FileUploadSession::new(cfg, None).await?;
-    let mut cleaner = session.start_clean(None, size, None).await;
+    let mut cleaner = session.start_clean(None, source_size, None).await;
 
+    let mut file = fs::File::open(&source_path)?;
     let mut buf = vec![0u8; 1024 * 1024];
     loop {
-        let n = reader.read(&mut buf)?;
+        let n = file.read(&mut buf)?;
         if n == 0 {
             break;
         }
         cleaner.add_data(&buf[..n]).await?;
     }
+
     let (file_info, _) = cleaner.finish().await?;
     session.finalize().await?;
+
     io::stdout().write_all(file_info.as_pointer_file()?.as_bytes())?;
+
+    if source_path.starts_with(base.join("tmp")) {
+        let _ = fs::remove_file(source_path);
+    }
+
     Ok(())
 }
 
-async fn smudge(path: PathBuf) -> Result<()> {
+fn prepare_clean_source(repo_root: &Path, base: &Path, path: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(path) = path {
+        let full_path = repo::resolve_path(repo_root, &path);
+        if full_path.exists() {
+            return Ok(full_path);
+        }
+    }
+
+    let tmp_dir = base.join("tmp");
+    fs::create_dir_all(&tmp_dir)?;
+    let tmp_path = tmp_dir.join(format!("clean-stdin-{}.tmp", std::process::id()));
+
+    let mut temp = fs::File::create(&tmp_path)?;
+    let mut stdin = io::stdin().lock();
+    io::copy(&mut stdin, &mut temp)?;
+    temp.flush()?;
+
+    Ok(tmp_path)
+}
+
+async fn smudge(path: Option<PathBuf>) -> Result<()> {
     let repo_root = repo::repo_root()?;
     let base = repo_root.join(".xet_ai");
     fs::create_dir_all(&base)?;
@@ -184,7 +205,11 @@ async fn smudge(path: PathBuf) -> Result<()> {
 
     let cfg = Arc::new(TranslatorConfig::local_config(base)?);
     let downloader = FileDownloader::new(cfg).await?;
-    let file_name: Arc<str> = Arc::from(path.to_string_lossy().into_owned());
+    let file_label: Arc<str> = Arc::from(
+        path.as_ref()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| "<unknown>".to_string()),
+    );
     let output = DataOutput::writer(io::stdout());
 
     let hash = xet_file
@@ -192,7 +217,7 @@ async fn smudge(path: PathBuf) -> Result<()> {
         .map_err(|_| anyhow!("Xet hash is corrupted"))?;
 
     match downloader
-        .smudge_file_from_hash(&hash, file_name, output, None, None)
+        .smudge_file_from_hash(&hash, file_label.clone(), output, None, None)
         .await
     {
         Ok(_) => Ok(()),
@@ -201,7 +226,7 @@ async fn smudge(path: PathBuf) -> Result<()> {
             if msg.contains("not found") || msg.contains("no such") || msg.contains("missing") {
                 eprintln!(
                     "warning: missing CAS data; run `xet-ai pull <remote>` then `git checkout -f -- {}`",
-                    path.display()
+                    file_label
                 );
                 io::stdout().write_all(&pointer_bytes)?;
                 Ok(())
@@ -258,19 +283,36 @@ fn push(name: &str) -> Result<()> {
     }
 
     let repo_id = repo::load_repo_id(&repo_root)?;
-    let src = repo_root.join(".xet_ai").join("xet");
-    let dst = repo::resolve_path(&repo_root, &remote.path)
-        .join(repo_id)
-        .join("xet");
-    let summary = sync::copy_missing_recursive(&src, &dst)?;
+    let git_sha = repo::git_head_sha(&repo_root)?;
+    let local_cas_root = repo_root.join(".xet_ai").join("xet");
+
+    let remote_repo_root = repo::resolve_path(&repo_root, &remote.path).join(&repo_id);
+    let remote_cas_root = remote_repo_root.join("xet");
+    let remote_manifest_dir = remote_repo_root.join("manifests");
+
+    let manifest = sync::build_manifest(&repo_id, &git_sha, &local_cas_root)?;
+    let summary = sync::push_with_manifest(&local_cas_root, &remote_cas_root, &manifest)?;
+
+    let manifest_path = remote_manifest_dir.join(format!("{git_sha}.json"));
+    sync::write_manifest_atomic(&manifest_path, &manifest)?;
+    let head_path = remote_manifest_dir.join("HEAD");
+    sync::write_head_atomic(&head_path, &git_sha)?;
+
     println!(
         "copied {} files ({} bytes)",
         summary.files_copied, summary.bytes_copied
     );
+    println!(
+        "wrote manifest {} with {} entries (total bytes {})",
+        git_sha,
+        manifest.entries.len(),
+        manifest.total_bytes
+    );
+    println!("updated HEAD -> {}", git_sha);
     Ok(())
 }
 
-fn pull(name: &str) -> Result<()> {
+fn pull(name: &str, git_ref: Option<&str>) -> Result<()> {
     let repo_root = repo::repo_root()?;
     let cfg = AppConfig::load(&repo_root)?;
     let remote = cfg
@@ -282,14 +324,37 @@ fn pull(name: &str) -> Result<()> {
     }
 
     let repo_id = repo::load_repo_id(&repo_root)?;
-    let src = repo::resolve_path(&repo_root, &remote.path)
-        .join(repo_id)
-        .join("xet");
-    let dst = repo_root.join(".xet_ai").join("xet");
-    let summary = sync::copy_missing_recursive(&src, &dst)?;
+    let remote_repo_root = repo::resolve_path(&repo_root, &remote.path).join(&repo_id);
+    let remote_manifest_dir = remote_repo_root.join("manifests");
+
+    let sha = if let Some(r) = git_ref {
+        r.to_string()
+    } else {
+        sync::read_head(&remote_manifest_dir.join("HEAD"))?
+    };
+
+    let remote_manifest_path = remote_manifest_dir.join(format!("{sha}.json"));
+    let manifest = sync::read_manifest(&remote_manifest_path)?;
+
+    let local_manifest_path = repo_root
+        .join(".xet_ai")
+        .join("manifests")
+        .join(format!("{sha}.json"));
+    sync::cache_manifest(&local_manifest_path, &manifest)?;
+
+    let local_cas_root = repo_root.join(".xet_ai").join("xet");
+    let remote_cas_root = remote_repo_root.join("xet");
+    let summary = sync::pull_from_manifest(&remote_cas_root, &local_cas_root, &manifest)?;
+
+    println!(
+        "pulled manifest {} ({})",
+        sha,
+        local_manifest_path.display()
+    );
     println!(
         "copied {} files ({} bytes)",
         summary.files_copied, summary.bytes_copied
     );
+    println!("verified {} files", summary.files_verified);
     Ok(())
 }

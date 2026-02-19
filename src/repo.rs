@@ -30,6 +30,25 @@ pub fn run_git<const N: usize>(args: [&str; N]) -> Result<()> {
     Ok(())
 }
 
+pub fn run_git_capture_stdout(repo_root: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .current_dir(repo_root)
+        .args(args)
+        .output()
+        .context("failed to execute git")?;
+    if !output.status.success() {
+        bail!(
+            "git command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+pub fn git_head_sha(repo_root: &Path) -> Result<String> {
+    run_git_capture_stdout(repo_root, &["rev-parse", "HEAD"])
+}
+
 pub fn append_if_missing(path: &Path, line: &str) -> Result<()> {
     let mut content = if path.exists() {
         fs::read_to_string(path)?

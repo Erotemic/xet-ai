@@ -18,39 +18,34 @@ cargo update
 cargo build --release
 ```
 
+## Repo identity
+
+`xet-ai init` creates a tracked `.xet_ai_repo_id` file if missing. Commit this file so all clones share the same remote namespace.
+
+## Manifest-based push/pull
+
+Push writes CAS objects and a manifest ref structure under:
+
+- `<remote>/<repo_id>/xet/...`
+- `<remote>/<repo_id>/manifests/<git_sha>.json`
+- `<remote>/<repo_id>/manifests/HEAD`
+
+Manifest JSON stores `repo_id`, `git_sha`, `total_bytes`, and per-file CAS metadata (`relpath`, `size`, `sha256`).
+
+Pull reads `manifests/HEAD` by default (or `--ref <sha>`) and syncs only files listed in that manifest.
+
+## Diagnostics
+
+```bash
+xet-ai debug cas-tree
+```
+
+Prints top-level `.xet_ai/xet/*` directories and INCLUDED/excluded status according to sync allowlist policy.
+
 ## Run end-to-end demo
 
 ```bash
 bash scripts/e2e.sh
 ```
 
-The script simulates two machines with different clone directory names, verifies pointer pass-through before pull, then validates hydration after pull and checksum equality.
-
-## Minimal usage
-
-```bash
-git init
-xet-ai init
-# commit stable repo identity so clones share one remote namespace
-git add .xet_ai_repo_id
-git commit -m "track xet-ai repo id"
-
-# add a large .bin file tracked by git filter
-python3 - <<'PY'
-with open('big.bin','wb') as f:
-    f.write(b'a' * (4 * 1024 * 1024))
-PY
-
-git add big.bin
-git commit -m "add large blob"
-
-xet-ai remote add origin /tmp/xet-ai-remote
-xet-ai push origin
-
-# inspect what CAS directories are synced
-xet-ai debug cas-tree
-
-# in another clone/repo:
-xet-ai pull origin
-git checkout -f -- big.bin
-```
+The script simulates two machines with different clone directory names, validates manifest creation/HEAD updates, verifies pointer pass-through before pull, and validates hydration + checksum parity after pull.
