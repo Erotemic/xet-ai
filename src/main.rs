@@ -15,6 +15,8 @@ use data::configurations::TranslatorConfig;
 use data::{FileDownloader, FileUploadSession, XetFileInfo};
 use file_reconstruction::DataOutput;
 use uuid::Uuid;
+use xet_ai_core::pointers;
+use xet_ai_core::reachability::{self, PointerHashHydrator};
 use xet_runtime::XetRuntime;
 
 #[derive(Parser, Debug)]
@@ -44,11 +46,15 @@ enum Commands {
         refname: Option<String>,
         #[arg(long)]
         force_lock: bool,
+        #[arg(long)]
+        all_cas: bool,
     },
     Pull {
         name: Option<String>,
         #[arg(long = "ref")]
         git_ref: Option<String>,
+        #[arg(long)]
+        all_cas: bool,
     },
     Remote {
         #[command(subcommand)]
@@ -129,8 +135,13 @@ async fn run() -> Result<()> {
             name,
             refname,
             force_lock,
-        } => push(name.as_deref(), refname.as_deref(), force_lock),
-        Commands::Pull { name, git_ref } => pull(name.as_deref(), git_ref.as_deref(), true),
+            all_cas,
+        } => push(name.as_deref(), refname.as_deref(), force_lock, all_cas),
+        Commands::Pull {
+            name,
+            git_ref,
+            all_cas,
+        } => pull(name.as_deref(), git_ref.as_deref(), true, all_cas),
         Commands::Remote { command } => match command {
             RemoteCommands::Add { name, path, local } => remote_add(&name, &path, local),
             RemoteCommands::List => remote_list(),
@@ -291,7 +302,7 @@ async fn smudge(path: Option<PathBuf>) -> Result<()> {
                 if effective.auto_pull_on_smudge && !already_attempted {
                     if let Some(remote) = effective.default_remote {
                         std::env::set_var("XET_AI_SMUDGE_AUTOPULL_ATTEMPT", "1");
-                        let pulled = pull(Some(&remote), None, false).is_ok();
+                        let pulled = pull(Some(&remote), None, false, false).is_ok();
                         std::env::remove_var("XET_AI_SMUDGE_AUTOPULL_ATTEMPT");
 
                         if pulled {
@@ -508,7 +519,12 @@ fn remote_head(remote_name: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn push(remote_name: Option<&str>, refname_opt: Option<&str>, force_lock: bool) -> Result<()> {
+fn push(
+    remote_name: Option<&str>,
+    refname_opt: Option<&str>,
+    force_lock: bool,
+    all_cas: bool,
+) -> Result<()> {
     let repo_root = repo::repo_root()?;
     let cfg = EffectiveConfig::load(&repo_root)?;
     let name = resolve_remote_name(remote_name, &cfg)?;
@@ -532,7 +548,27 @@ fn push(remote_name: Option<&str>, refname_opt: Option<&str>, force_lock: bool) 
     let remote_manifest_dir = remote_repo_root.join("manifests");
 
     let hash_cache_path = xet_ai_root.join("hash_cache.json");
-    let manifest = sync::build_manifest(&repo_id, &git_sha, &local_cas_root, &hash_cache_path)?;
+    let pointer_index = reachability::load_or_build_pointer_index(&repo_root, &git_sha, &repo_id)?;
+    let mut hydrator = PointerHashHydrator::new(&local_cas_root)?;
+    let plan = reachability::plan_reachable_cas(
+        &repo_root,
+        &local_cas_root,
+        &repo_id,
+        &git_sha,
+        &mut hydrator,
+    )?;
+
+    let manifest = if all_cas {
+        sync::build_manifest(&repo_id, &git_sha, &local_cas_root, &hash_cache_path)?
+    } else {
+        sync::build_manifest_for_relpaths(
+            &repo_id,
+            &git_sha,
+            &local_cas_root,
+            &hash_cache_path,
+            &plan.required_cas_relpaths,
+        )?
+    };
     let summary = sync::push_with_manifest(&local_cas_root, &remote_cas_root, &manifest)?;
 
     let local_manifest_path = manifest_path(&repo_root, &git_sha);
@@ -542,6 +578,14 @@ fn push(remote_name: Option<&str>, refname_opt: Option<&str>, force_lock: bool) 
     sync::write_manifest_atomic(&manifest_path, &manifest)?;
     let head_path = remote_manifest_dir.join("HEAD");
     sync::write_head_atomic(&head_path, &git_sha)?;
+
+    pointers::cache_pointer_index(&repo_root, &pointer_index)?;
+    let remote_pointer_dir = remote_repo_root.join("pointers");
+    sync::atomic_write_string(
+        &remote_pointer_dir.join(format!("{git_sha}.json")),
+        &serde_json::to_string_pretty(&pointer_index)?,
+    )?;
+    sync::write_head_atomic(&remote_pointer_dir.join("HEAD"), &git_sha)?;
 
     let refname = refname_opt
         .map(|s| s.to_string())
@@ -562,11 +606,23 @@ fn push(remote_name: Option<&str>, refname_opt: Option<&str>, force_lock: bool) 
         manifest.entries.len(),
         manifest.total_bytes
     );
+    if !all_cas {
+        println!(
+            "reachability: {} pointer files, {} required CAS files",
+            plan.pointer_paths.len(),
+            plan.required_cas_relpaths.len()
+        );
+    }
     println!("updated HEAD -> {}", git_sha);
     Ok(())
 }
 
-fn pull(remote_name: Option<&str>, git_ref: Option<&str>, verbose: bool) -> Result<()> {
+fn pull(
+    remote_name: Option<&str>,
+    git_ref: Option<&str>,
+    verbose: bool,
+    all_cas: bool,
+) -> Result<()> {
     let repo_root = repo::repo_root()?;
     let cfg = EffectiveConfig::load(&repo_root)?;
     let name = resolve_remote_name(remote_name, &cfg)?;
@@ -584,13 +640,19 @@ fn pull(remote_name: Option<&str>, git_ref: Option<&str>, verbose: bool) -> Resu
     let remote_manifest_path = remote_repo_root
         .join("manifests")
         .join(format!("{sha}.json"));
-    let manifest = sync::read_manifest(&remote_manifest_path)?;
+    let remote_cas_root = remote_repo_root.join("xet");
+    let local_cas_root = repo_root.join(".xet_ai").join("xet");
+    let hash_cache_path = repo_root.join(".xet_ai").join("hash_cache.json");
+
+    let manifest = if all_cas {
+        sync::build_manifest("all-cas", &sha, &remote_cas_root, &hash_cache_path)?
+    } else {
+        sync::read_manifest(&remote_manifest_path)?
+    };
 
     let local_manifest_path = manifest_path(&repo_root, &sha);
     sync::cache_manifest(&local_manifest_path, &manifest)?;
 
-    let local_cas_root = repo_root.join(".xet_ai").join("xet");
-    let remote_cas_root = remote_repo_root.join("xet");
     let summary = sync::pull_from_manifest(&remote_cas_root, &local_cas_root, &manifest)?;
 
     if verbose {

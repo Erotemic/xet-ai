@@ -165,3 +165,35 @@ What I think went especially well is that the e2e script now exercises the same 
 ### Open questions / hypotheses
 - Hypothesis: teams will mostly want shared `default_remote`, but local override frequency will still be high for `auto_pull_on_smudge`.
 - Open question: should lock stale duration be configurable per remote in future iterations?
+
+## 2026-02-19 (commit: pending) — Reachability planning + minimal push/pull integration
+
+### What changed
+- Fixed formatting and aligned the tree for CI style gates.
+- Consolidated binary modules into thin wrappers that delegate shared logic to `xet_ai_core` (`src/config.rs`, `src/repo.rs`, `src/sync.rs`).
+- Added `xet_ai_core::repo` with repo identity/path helpers and git2-based HEAD/branch helpers.
+- Added `xet_ai_core::reachability` with:
+  - `ReachabilityPlan`
+  - CAS access/hydration traits
+  - tracing access recorder
+  - pointer-cache-aware planner
+  - default hash-token hydrator strategy
+  - focused unit test using temp repo + fake hydrator over IO abstraction.
+- Extended sync manifest builder to support a relpath subset (`build_manifest_for_relpaths`) for minimal manifests.
+- Updated CLI push/pull:
+  - default push computes reachability and writes minimal manifest, plus remote pointer indexes (`pointers/<sha>.json`, `pointers/HEAD`).
+  - fallback `--all-cas` keeps prior allowlisted full CAS sync behavior.
+  - pull supports `--all-cas` fallback to fetch allowlisted remote CAS, otherwise uses remote manifest.
+- Extended e2e to validate remote pointer index creation and compare default minimal push vs `--all-cas` on a fresh remote.
+
+### Why / design notes
+- The thin-wrapper approach removes duplicate “truth” while minimizing churn in CLI command flow.
+- Reachability now has an explicit extension point (`PointerHydrator` + `CasFileAccess`) so we can later replace heuristic hydration with true xet-core IO-bound tracing without rewriting planner call sites.
+- Minimal manifests are now first-class and can be consumed uniformly by existing push/pull copy+verify logic.
+
+### State of mind / reflections
+This iteration felt like a careful compromise between architectural direction and practical correctness risk. I’m satisfied that we now have an explicit reachability planning interface and that command behavior can switch between minimal and `--all-cas` fallback predictably. The major risk I still feel is fidelity of the default pointer hash-token hydrator: it is deterministic and testable, but it remains a heuristic until we complete deeper tracing through xet-core’s actual read paths. I chose to make that risk obvious in structure rather than hiding it in ad-hoc code.
+
+I’m more confident in the maintainability outcome than in the immediate optimality of transferred bytes for all real-world pointer shapes. The upside is we now have clean seams to improve correctness (swap hydrator implementation), testability (pure unit tests with fake hydrators), and performance (cache-aware planning) incrementally.
+
+The tradeoff I kept revisiting was whether to attempt invasive xet-core integration now or stabilize planner interfaces first. Given sprint scope and CI reliability requirements, interface-first felt safer and easier to verify end-to-end. The e2e enhancement gives a concrete signal that default mode is more minimal than full sync, which helps validate product direction while acknowledging we still have room to improve exactness.

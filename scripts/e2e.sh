@@ -24,11 +24,12 @@ tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 
 remote_dir="$tmpdir/remote"
+remote_full_dir="$tmpdir/remote-full"
 machineA="$tmpdir/machineA"
 machineB="$tmpdir/machineB"
 repoA="$machineA/project_A"
 repoB="$machineB/project_B"
-mkdir -p "$remote_dir" "$machineA" "$machineB"
+mkdir -p "$remote_dir" "$remote_full_dir" "$machineA" "$machineB"
 
 git init "$repoA" >/dev/null
 cd "$repoA"
@@ -61,14 +62,15 @@ repo_id="$(tr -d '\n' < .xet_ai_repo_id)"
 
 push1_output="$(xet-ai push origin --ref main)"
 echo "$push1_output"
-bytes_push1="$(echo "$push1_output" | extract_bytes)"
 manifest_head="$remote_dir/$repo_id/manifests/HEAD"
 manifest_sha1="$remote_dir/$repo_id/manifests/$sha1.json"
+pointer_sha1="$remote_dir/$repo_id/pointers/$sha1.json"
 ref_main="$remote_dir/$repo_id/refs/main"
 
 [[ -f "$manifest_head" ]] || { echo "missing remote HEAD" >&2; exit 1; }
 [[ -f "$manifest_sha1" ]] || { echo "missing remote manifest sha1" >&2; exit 1; }
 [[ -f "$ref_main" ]] || { echo "missing remote refs/main" >&2; exit 1; }
+[[ -f "$pointer_sha1" ]] || { echo "missing remote pointer index sha1" >&2; exit 1; }
 [[ "$(tr -d '\n' < "$manifest_head")" == "$sha1" ]] || { echo "HEAD mismatch" >&2; exit 1; }
 [[ "$(tr -d '\n' < "$ref_main")" == "$sha1" ]] || { echo "refs/main mismatch" >&2; exit 1; }
 [[ -f ".xet_ai/manifests/$sha1.json" ]] || { echo "missing local cached manifest after push1" >&2; exit 1; }
@@ -92,6 +94,7 @@ echo "$push2_output"
 bytes_push2="$(echo "$push2_output" | extract_bytes)"
 
 [[ -f "$remote_dir/$repo_id/manifests/$sha2.json" ]] || { echo "missing remote manifest sha2" >&2; exit 1; }
+[[ -f "$remote_dir/$repo_id/pointers/$sha2.json" ]] || { echo "missing remote pointer index sha2" >&2; exit 1; }
 [[ "$(tr -d '\n' < "$manifest_head")" == "$sha2" ]] || { echo "HEAD mismatch after push2" >&2; exit 1; }
 [[ "$(tr -d '\n' < "$ref_main")" == "$sha2" ]] || { echo "refs/main mismatch after push2" >&2; exit 1; }
 [[ -f ".xet_ai/manifests/$sha2.json" ]] || { echo "missing local cached manifest after push2" >&2; exit 1; }
@@ -103,6 +106,27 @@ if (( bytes_push2 >= 20 * 1024 * 1024 )); then
 fi
 
 sha_a="$(sha256sum big.bin | awk '{print $1}')"
+
+# Compare minimal default push against all-cas fallback on a fresh remote.
+xet-ai remote add full "$remote_full_dir"
+full_push_output="$(xet-ai push full --ref main --all-cas)"
+echo "$full_push_output"
+manifest_default_entries="$(python3 - <<PY
+import json
+from pathlib import Path
+print(len(json.loads(Path('$remote_dir/$repo_id/manifests/$sha2.json').read_text())['entries']))
+PY
+)"
+manifest_full_entries="$(python3 - <<PY
+import json
+from pathlib import Path
+print(len(json.loads(Path('$remote_full_dir/$repo_id/manifests/$sha2.json').read_text())['entries']))
+PY
+)"
+if (( manifest_default_entries > manifest_full_entries )); then
+  echo "Expected default manifest entries ($manifest_default_entries) <= all-cas entries ($manifest_full_entries)" >&2
+  exit 1
+fi
 
 cd "$machineB"
 git clone "$repoA" "$repoB" >/dev/null

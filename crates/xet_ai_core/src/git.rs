@@ -15,7 +15,10 @@ pub fn repo_root(repo_root_or_cwd: &Path) -> Result<PathBuf> {
 }
 
 pub fn head_sha(repo: &Repository) -> Result<String> {
-    let oid = repo.head()?.target().ok_or_else(|| anyhow!("invalid HEAD"))?;
+    let oid = repo
+        .head()?
+        .target()
+        .ok_or_else(|| anyhow!("invalid HEAD"))?;
     Ok(oid.to_string())
 }
 

@@ -175,7 +175,32 @@ pub fn build_manifest(
     hash_cache_path: &Path,
 ) -> Result<Manifest> {
     let mut hasher = FileHashProvider;
-    build_manifest_with_hasher(repo_id, git_sha, cas_root, hash_cache_path, &mut hasher)
+    build_manifest_with_hasher(
+        repo_id,
+        git_sha,
+        cas_root,
+        hash_cache_path,
+        None,
+        &mut hasher,
+    )
+}
+
+pub fn build_manifest_for_relpaths(
+    repo_id: &str,
+    git_sha: &str,
+    cas_root: &Path,
+    hash_cache_path: &Path,
+    relpaths: &[String],
+) -> Result<Manifest> {
+    let mut hasher = FileHashProvider;
+    build_manifest_with_hasher(
+        repo_id,
+        git_sha,
+        cas_root,
+        hash_cache_path,
+        Some(relpaths),
+        &mut hasher,
+    )
 }
 
 fn build_manifest_with_hasher(
@@ -183,11 +208,15 @@ fn build_manifest_with_hasher(
     git_sha: &str,
     cas_root: &Path,
     hash_cache_path: &Path,
+    only_relpaths: Option<&[String]>,
     hasher: &mut dyn HashProvider,
 ) -> Result<Manifest> {
     let mut cache = load_hash_cache(hash_cache_path)?;
     let mut entries = Vec::new();
     let mut total_bytes = 0u64;
+
+    let requested: Option<std::collections::HashSet<&str>> =
+        only_relpaths.map(|paths| paths.iter().map(|s| s.as_str()).collect());
 
     if cas_root.exists() {
         for entry in WalkDir::new(cas_root).into_iter().filter_map(|e| e.ok()) {
@@ -200,6 +229,11 @@ fn build_manifest_with_hasher(
             }
 
             let relpath = rel.to_string_lossy().to_string();
+            if let Some(requested) = &requested {
+                if !requested.contains(relpath.as_str()) {
+                    continue;
+                }
+            }
             let size = entry.metadata()?.len();
             let sha256 = match cache.entries.get(&relpath) {
                 Some(cached) if cached.size == size => cached.sha256.clone(),
@@ -261,10 +295,10 @@ pub fn read_head(path: &Path) -> Result<String> {
 }
 
 pub fn read_manifest(path: &Path) -> Result<Manifest> {
-    let content =
-        fs::read_to_string(path).with_context(|| format!("manifest missing: {}", path.display()))?;
-    let manifest: Manifest =
-        serde_json::from_str(&content).with_context(|| format!("manifest corrupt: {}", path.display()))?;
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("manifest missing: {}", path.display()))?;
+    let manifest: Manifest = serde_json::from_str(&content)
+        .with_context(|| format!("manifest corrupt: {}", path.display()))?;
     Ok(manifest)
 }
 
@@ -510,7 +544,10 @@ pub fn acquire_push_lock(remote_repo_root: &Path, force_lock: bool) -> Result<Pu
             .unwrap_or(false);
 
         if force_lock || stale {
-            eprintln!("warning: breaking existing push lock at {}", lock_path.display());
+            eprintln!(
+                "warning: breaking existing push lock at {}",
+                lock_path.display()
+            );
             let _ = fs::remove_file(&lock_path);
         } else {
             bail!(
@@ -574,13 +611,15 @@ mod tests {
             .expect("failed to write test cas file");
 
         let mut h1 = CountingHasher { calls: 0 };
-        let _ = build_manifest_with_hasher("repo", "sha1", &cas_root, &hash_cache_path, &mut h1)
-            .expect("manifest build 1 failed");
+        let _ =
+            build_manifest_with_hasher("repo", "sha1", &cas_root, &hash_cache_path, None, &mut h1)
+                .expect("manifest build 1 failed");
         assert_eq!(h1.calls, 1);
 
         let mut h2 = CountingHasher { calls: 0 };
-        let _ = build_manifest_with_hasher("repo", "sha1", &cas_root, &hash_cache_path, &mut h2)
-            .expect("manifest build 2 failed");
+        let _ =
+            build_manifest_with_hasher("repo", "sha1", &cas_root, &hash_cache_path, None, &mut h2)
+                .expect("manifest build 2 failed");
         assert_eq!(h2.calls, 0);
 
         let _ = fs::remove_dir_all(root);
@@ -596,8 +635,14 @@ mod tests {
         fs::write(root.join("refs/main"), format!("{}\n", sha)).expect("write ref");
         fs::write(root.join("manifests/HEAD"), format!("{}\n", sha)).expect("write head");
 
-        assert_eq!(resolve_ref_or_sha(&root, Some(sha)).expect("sha resolve"), sha);
-        assert_eq!(resolve_ref_or_sha(&root, Some("main")).expect("ref resolve"), sha);
+        assert_eq!(
+            resolve_ref_or_sha(&root, Some(sha)).expect("sha resolve"),
+            sha
+        );
+        assert_eq!(
+            resolve_ref_or_sha(&root, Some("main")).expect("ref resolve"),
+            sha
+        );
         assert_eq!(resolve_ref_or_sha(&root, None).expect("head resolve"), sha);
 
         let _ = fs::remove_dir_all(root);

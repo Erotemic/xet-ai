@@ -45,7 +45,10 @@ pub fn build_pointer_index(repo_root: &Path, git_sha: &str, repo_id: &str) -> Re
 }
 
 pub fn pointer_cache_path(repo_root: &Path, sha: &str) -> std::path::PathBuf {
-    repo_root.join(".xet_ai").join("pointers").join(format!("{sha}.json"))
+    repo_root
+        .join(".xet_ai")
+        .join("pointers")
+        .join(format!("{sha}.json"))
 }
 
 pub fn cache_pointer_index(repo_root: &Path, index: &PointerIndex) -> Result<()> {
@@ -126,7 +129,8 @@ mod tests {
     #[test]
     fn build_pointer_index_finds_only_pointer_files() {
         let (root, repo) = init_repo();
-        let pointer_json = br#"{"hash":"0123456789abcdef0123456789abcdef01234567","file_size":123}"#;
+        let pointer_json =
+            br#"{"hash":"0123456789abcdef0123456789abcdef01234567","file_size":123}"#;
         let sha = commit_files(
             &repo,
             &[("big.bin", pointer_json), ("notes.txt", b"hello")],
@@ -143,7 +147,8 @@ mod tests {
     #[test]
     fn pointer_cache_roundtrip() {
         let (root, repo) = init_repo();
-        let pointer_json = br#"{"hash":"0123456789abcdef0123456789abcdef01234567","file_size":123}"#;
+        let pointer_json =
+            br#"{"hash":"0123456789abcdef0123456789abcdef01234567","file_size":123}"#;
         let sha = commit_files(&repo, &[("big.bin", pointer_json)], "add pointer");
         let idx = build_pointer_index(&root, &sha, "repo-id").expect("build index");
 
