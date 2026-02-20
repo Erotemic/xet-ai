@@ -298,6 +298,19 @@ pub fn doctor() -> Result<()> {
     if !repo_id_path.exists() {
         eprintln!("xet-ai: missing {}", repo::REPO_ID_FILE);
         ok = false;
+    } else {
+        let tracked = std::process::Command::new("git")
+            .current_dir(&repo_root)
+            .args(["ls-files", "--error-unmatch", repo::REPO_ID_FILE])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !tracked {
+            eprintln!(
+                "xet-ai: warning: {} is not committed; commit it so clones share identity",
+                repo::REPO_ID_FILE
+            );
+        }
     }
 
     let cfg = EffectiveConfig::load(&repo_root)?;
@@ -321,6 +334,12 @@ pub fn doctor() -> Result<()> {
             "xet-ai: cannot access local CAS root {}",
             cas_root.display()
         );
+        ok = false;
+    }
+
+    let passthrough_ok = serde_json::from_slice::<XetFileInfo>(b"not-a-pointer").is_err();
+    if !passthrough_ok {
+        eprintln!("xet-ai: smudge pass-through parser check failed");
         ok = false;
     }
 
@@ -625,6 +644,7 @@ pub async fn push(
     refname_opt: Option<&str>,
     force_lock: bool,
     mode: PushMode,
+    plan_only: bool,
 ) -> Result<()> {
     let repo_root = repo::repo_root()?;
     let cfg = EffectiveConfig::load(&repo_root)?;
@@ -686,12 +706,16 @@ pub async fn push(
         )
         .await?;
         if !ok {
-            eprintln!("warning: minimal reachability validation failed; falling back to --all-cas for this push");
+            eprintln!(
+                "xet-ai: warning: minimal reachability validation failed; falling back to --all-cas for this push"
+            );
             used_all_cas = true;
         }
     }
     if mode == PushMode::MinimalNoValidate {
-        eprintln!("warning: running minimal push without validation (--minimal-no-validate)");
+        eprintln!(
+            "xet-ai: warning: running minimal push without validation (--minimal-no-validate)"
+        );
     }
 
     let manifest = if used_all_cas {
@@ -705,6 +729,18 @@ pub async fn push(
             &plan.required_cas_relpaths,
         )?
     };
+
+    if plan_only {
+        println!(
+            "plan-only: mode={} pointer_files={} required_cas_files={} manifest_entries={} manifest_bytes={}",
+            if used_all_cas { "all-cas" } else { "minimal" },
+            plan.pointer_paths.len(),
+            plan.required_cas_relpaths.len(),
+            manifest.entries.len(),
+            manifest.total_bytes,
+        );
+        return Ok(());
+    }
 
     let summary = sync::push_with_manifest_store(&local_cas_root, &store, &manifest)?;
 

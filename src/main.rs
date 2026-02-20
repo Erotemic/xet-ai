@@ -46,6 +46,8 @@ enum Commands {
         #[arg(long = "ref")]
         refname: Option<String>,
         #[arg(long)]
+        plan_only: bool,
+        #[arg(long)]
         force_lock: bool,
         #[arg(long)]
         all_cas: bool,
@@ -165,6 +167,7 @@ async fn run() -> Result<()> {
         Commands::Push {
             name,
             refname,
+            plan_only,
             force_lock,
             all_cas,
             minimal_no_validate,
@@ -176,7 +179,14 @@ async fn run() -> Result<()> {
             } else {
                 PushMode::MinimalValidate
             };
-            commands::push(name.as_deref(), refname.as_deref(), force_lock, mode).await
+            commands::push(
+                name.as_deref(),
+                refname.as_deref(),
+                force_lock,
+                mode,
+                plan_only,
+            )
+            .await
         }
         Commands::Pull {
             name,
@@ -275,7 +285,7 @@ async fn smudge(path: Option<PathBuf>) -> Result<()> {
     let xet_file: XetFileInfo = match serde_json::from_slice(&pointer_bytes) {
         Ok(v) => v,
         Err(_) => {
-            eprintln!("warning: input is not a xet pointer; passing through unchanged");
+            eprintln!("xet-ai: warning: input is not a xet pointer; passing through unchanged");
             io::stdout().write_all(&pointer_bytes)?;
             return Ok(());
         }
@@ -322,13 +332,13 @@ async fn smudge(path: Option<PathBuf>) -> Result<()> {
                 }
 
                 eprintln!(
-                    "warning: missing CAS data; run `xet-ai pull <remote>` then `git checkout -f -- {}`",
+                    "xet-ai: warning: missing CAS data; run `xet-ai pull <remote>` then `git checkout -f -- {}`",
                     file_label
                 );
                 io::stdout().write_all(&pointer_bytes)?;
                 Ok(())
             } else {
-                eprintln!("error: failed to hydrate pointer: {e}");
+                eprintln!("xet-ai: error: failed to hydrate pointer: {e}");
                 bail!(e)
             }
         }

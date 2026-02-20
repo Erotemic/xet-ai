@@ -51,6 +51,7 @@ git checkout -f -- .
 xet-ai status
 xet-ai doctor
 xet-ai track "*.bin" "*.parquet"
+xet-ai push origin --ref main --plan-only
 xet-ai remote refs origin
 xet-ai remote tx list origin
 xet-ai remote tx gc origin --older-than 120
@@ -76,7 +77,7 @@ Local values override shared values. `auto_pull_on_smudge` is local-only and opt
 
 - Reachability planning is heuristic and may fall back to all-CAS.
 - Filesystem remote backend only.
-- No full remote GC of published objects yet (transaction cleanup only).
+- No full remote GC of published objects yet (transaction cleanup only via `remote tx gc`).
 - No HuggingFace Hub / network backend integration yet.
 
 ## Development checks

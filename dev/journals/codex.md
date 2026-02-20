@@ -244,3 +244,19 @@ This sprint felt like paying down “accidental risk debt” introduced by a fas
 The transaction marker fix was also a good reminder that naming carries operational meaning. Calling something “committed” too early is worse than no marker because it can mislead debugging and automation. Splitting staged/published states made semantics clearer and made tests much easier to reason about.
 
 I still see brittle edges: validation currently hydrates a representative pointer, which is safer than no validation but still probabilistic relative to full commit coverage. The current fallback strategy contains blast radius, but future work should improve planner fidelity and validation breadth without tanking UX. Even with those tradeoffs, this revision feels notably more trustworthy than the previous one.
+
+## 2026-02-19 (commit: pending) — Alpha UX follow-through: plan-only dry run + logging polish
+
+### What changed
+- Added `xet-ai push --plan-only` as a dry-run mode that computes reachability and manifest summary without writing remote CAS/manifests/refs.
+- Standardized warning/error log prefixes to `xet-ai:` in CLI smudge and push lock/minimal-mode warning paths.
+- Improved doctor guidance by checking whether `.xet_ai_repo_id` is tracked in git and emitting actionable warning when missing.
+- Added a lightweight smudge pass-through parser sanity check in doctor.
+- Updated README useful commands and limitations wording to include `--plan-only` and clarify tx-gc scope.
+
+### State of mind / reflections
+This pass was less about adding brand-new capability and more about making existing behavior safer and easier to reason about in everyday use. The largest bug-risk I wanted to eliminate was accidental remote mutation during planning/debugging, so `--plan-only` now exits before transfer/publish. That gives developers a practical way to inspect minimal-vs-all-cas behavior without touching shared state.
+
+I also tightened logging consistency because alpha usability is often won or lost in debugging sessions. Consistent `xet-ai:` prefixes make warnings easier to grep and less ambiguous in filter-heavy git command output.
+
+Doctor remains intentionally pragmatic: it catches high-impact misconfigurations without trying to be exhaustive. The new repo-id tracked check addresses a real operational footgun for cloned repos while keeping the command fast.

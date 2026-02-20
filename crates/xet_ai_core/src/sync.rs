@@ -767,7 +767,7 @@ pub fn acquire_push_lock(remote_repo_root: &Path, force_lock: bool) -> Result<Pu
 
         if force_lock || stale {
             eprintln!(
-                "warning: breaking existing push lock at {}",
+                "xet-ai: warning: breaking existing push lock at {}",
                 lock_path.display()
             );
             let _ = fs::remove_file(&lock_path);
