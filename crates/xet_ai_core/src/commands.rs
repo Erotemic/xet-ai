@@ -770,40 +770,15 @@ fn finalize_update_live_refs(store: &dyn RemoteStore, tx: &TransactionArtifacts)
     }
     store.write_bytes_atomic(
         &format!("refs/{}", tx.refname),
-        format!(
-            "{}
-",
-            tx.git_sha
-        )
-        .as_bytes(),
+        format!("{}\n", tx.git_sha).as_bytes(),
     )?;
-    store.write_bytes_atomic(
-        "manifests/HEAD",
-        format!(
-            "{}
-",
-            tx.git_sha
-        )
-        .as_bytes(),
-    )?;
-    store.write_bytes_atomic(
-        "pointers/HEAD",
-        format!(
-            "{}
-",
-            tx.git_sha
-        )
-        .as_bytes(),
-    )?;
+    store.write_bytes_atomic("manifests/HEAD", format!("{}\n", tx.git_sha).as_bytes())?;
+    store.write_bytes_atomic("pointers/HEAD", format!("{}\n", tx.git_sha).as_bytes())?;
     Ok(())
 }
 
 fn finalize_mark_published(store: &dyn RemoteStore, tx: &TransactionArtifacts) -> Result<()> {
-    store.write_bytes_atomic(
-        &format!("tx/PUBLISHED/{}", tx.txid),
-        b"published
-",
-    )?;
+    store.write_bytes_atomic(&format!("tx/PUBLISHED/{}", tx.txid), b"published\n")?;
     Ok(())
 }
 
@@ -823,23 +798,44 @@ pub async fn push(
     plan_validate: bool,
 ) -> Result<()> {
     let repo_root = repo::repo_root()?;
-    let cfg = EffectiveConfig::load(&repo_root)?;
+    push_in_repo(
+        &repo_root,
+        remote_name,
+        refname_opt,
+        force_lock,
+        mode,
+        plan_only,
+        plan_validate,
+    )
+    .await
+}
+
+async fn push_in_repo(
+    repo_root: &Path,
+    remote_name: Option<&str>,
+    refname_opt: Option<&str>,
+    force_lock: bool,
+    mode: PushMode,
+    plan_only: bool,
+    plan_validate: bool,
+) -> Result<()> {
+    let cfg = EffectiveConfig::load(repo_root)?;
     let name = resolve_remote_name(remote_name, &cfg)?;
     let remote = cfg
         .remotes
         .get(&name)
         .with_context(|| format!("remote `{name}` not found"))?;
 
-    let repo_id = repo::load_repo_id(&repo_root)?;
-    let git_sha = repo::git_head_sha(&repo_root)?;
+    let repo_id = repo::load_repo_id(repo_root)?;
+    let git_sha = repo::git_head_sha(repo_root)?;
     let xet_ai_root = repo_root.join(".xet_ai");
     let local_cas_root = xet_ai_root.join("xet");
     let hash_cache_path = xet_ai_root.join("hash_cache.json");
 
-    let pointer_index = reachability::load_or_build_pointer_index(&repo_root, &git_sha, &repo_id)?;
+    let pointer_index = reachability::load_or_build_pointer_index(repo_root, &git_sha, &repo_id)?;
     let mut hydrator = PointerHashHydrator::new(&local_cas_root)?;
     let plan = reachability::plan_reachable_cas(
-        &repo_root,
+        repo_root,
         &local_cas_root,
         &repo_id,
         &git_sha,
@@ -850,7 +846,7 @@ pub async fn push(
     let should_validate = mode == PushMode::MinimalValidate && (!plan_only || plan_validate);
     if should_validate {
         let ok = validate_minimal_plan(
-            &repo_root,
+            repo_root,
             &git_sha,
             &plan.required_cas_relpaths,
             &pointer_index,
@@ -894,7 +890,7 @@ pub async fn push(
         return Ok(());
     }
 
-    let store = fs_remote_store(&repo_root, remote, &repo_id)?;
+    let store = fs_remote_store(repo_root, remote, &repo_id)?;
     let caps = store.capabilities();
     if !caps.supports_locking {
         bail!("remote backend does not support push locking");
@@ -922,13 +918,13 @@ pub async fn push(
 
     let summary = sync::push_with_manifest_store(&local_cas_root, &store, &manifest)?;
 
-    let local_manifest_path = manifest_path(&repo_root, &git_sha);
+    let local_manifest_path = manifest_path(repo_root, &git_sha);
     sync::cache_manifest(&local_manifest_path, &manifest)?;
-    pointers::cache_pointer_index(&repo_root, &pointer_index)?;
+    pointers::cache_pointer_index(repo_root, &pointer_index)?;
 
     let refname = refname_opt
         .map(|s| s.to_string())
-        .or_else(|| repo::git_current_branch_short(&repo_root).ok().flatten())
+        .or_else(|| repo::git_current_branch_short(repo_root).ok().flatten())
         .unwrap_or_else(|| "HEAD".to_string());
 
     let ts = std::time::SystemTime::now()
@@ -1049,8 +1045,6 @@ mod tests {
     use std::future::Future;
     use std::path::Path as StdPath;
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-
-    static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn noop_waker() -> Waker {
         unsafe fn clone(_: *const ()) -> RawWaker {
@@ -1243,19 +1237,9 @@ mod tests {
         let store = FilesystemRemoteStore::new(root.clone());
         std::fs::create_dir_all(root.join("tx/old")).expect("old dir");
         std::fs::create_dir_all(root.join("tx/new")).expect("new dir");
-        std::fs::write(
-            root.join("tx/STAGED/old"),
-            b"staged
-",
-        )
-        .ok();
+        std::fs::write(root.join("tx/STAGED/old"), b"staged\n").ok();
         std::fs::create_dir_all(root.join("tx/PUBLISHED")).expect("published dir");
-        std::fs::write(
-            root.join("tx/PUBLISHED/new"),
-            b"published
-",
-        )
-        .expect("pub marker");
+        std::fs::write(root.join("tx/PUBLISHED/new"), b"published\n").expect("pub marker");
         // ensure old appears old enough
         std::thread::sleep(std::time::Duration::from_millis(20));
         // call internal logic via direct filesystem simulation
@@ -1279,12 +1263,7 @@ mod tests {
             br#"{"hash":"0123456789abcdef0123456789abcdef01234567","file_size":123}"#;
         let _sha = commit_files(&repo, &[("big.bin", pointer_json)], "pointer commit");
 
-        std::fs::write(
-            root.join(repo::REPO_ID_FILE),
-            "repo-id
-",
-        )
-        .expect("repo id");
+        std::fs::write(root.join(repo::REPO_ID_FILE), "repo-id\n").expect("repo id");
         let mut shared = ConfigFile::default();
         shared.default_remote = Some("origin".to_string());
         shared.remotes.insert(
@@ -1297,11 +1276,8 @@ mod tests {
         config::save_shared(&root, &shared).expect("save cfg");
         std::fs::create_dir_all(root.join(".xet_ai").join("xet")).expect("local cas");
 
-        let _cwd_guard = CWD_LOCK.lock().expect("cwd lock");
-        let prev_cwd = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&root).expect("chdir");
-
-        let result = block_on_ready(push(
+        let result = block_on_ready(push_in_repo(
+            &root,
             Some("origin"),
             Some("main"),
             false,
@@ -1310,7 +1286,6 @@ mod tests {
             false,
         ));
 
-        std::env::set_current_dir(prev_cwd).expect("restore cwd");
         result.expect("plan-only push");
 
         let repo_id = "repo-id";
@@ -1334,12 +1309,7 @@ mod tests {
             br#"{"hash":"0123456789abcdef0123456789abcdef01234567","file_size":123}"#;
         let _sha = commit_files(&repo, &[("big.bin", pointer_json)], "pointer commit");
 
-        std::fs::write(
-            root.join(repo::REPO_ID_FILE),
-            "repo-id
-",
-        )
-        .expect("repo id");
+        std::fs::write(root.join(repo::REPO_ID_FILE), "repo-id\n").expect("repo id");
         let mut shared = ConfigFile::default();
         shared.default_remote = Some("origin".to_string());
         shared.remotes.insert(
@@ -1352,10 +1322,8 @@ mod tests {
         config::save_shared(&root, &shared).expect("save cfg");
         std::fs::create_dir_all(root.join(".xet_ai").join("xet")).expect("local cas");
 
-        let _cwd_guard = CWD_LOCK.lock().expect("cwd lock");
-        let prev_cwd = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&root).expect("chdir");
-        let result = block_on_ready(push(
+        let result = block_on_ready(push_in_repo(
+            &root,
             Some("origin"),
             Some("main"),
             false,
@@ -1363,8 +1331,12 @@ mod tests {
             true,
             false,
         ));
-        std::env::set_current_dir(prev_cwd).expect("restore cwd");
         result.expect("plan-only push");
+
+        assert!(std::fs::read_dir(&remote_root)
+            .expect("read remote root")
+            .next()
+            .is_none());
 
         let forbidden = ["tx", "manifests", "refs", "pointers"];
         for entry in walkdir::WalkDir::new(&remote_root)
@@ -1402,12 +1374,7 @@ mod tests {
             br#"{"hash":"0123456789abcdef0123456789abcdef01234567","file_size":123}"#;
         let _sha = commit_files(&repo, &[("big.bin", pointer_json)], "pointer commit");
 
-        std::fs::write(
-            root.join(repo::REPO_ID_FILE),
-            "repo-id
-",
-        )
-        .expect("repo id");
+        std::fs::write(root.join(repo::REPO_ID_FILE), "repo-id\n").expect("repo id");
         let mut shared = ConfigFile::default();
         shared.default_remote = Some("origin".to_string());
         shared.remotes.insert(
@@ -1422,10 +1389,8 @@ mod tests {
 
         reset_validation_call_count();
 
-        let _cwd_guard = CWD_LOCK.lock().expect("cwd lock");
-        let prev_cwd = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&root).expect("chdir");
-        let result = block_on_ready(push(
+        let result = block_on_ready(push_in_repo(
+            &root,
             Some("origin"),
             Some("main"),
             false,
@@ -1433,7 +1398,6 @@ mod tests {
             true,
             false,
         ));
-        std::env::set_current_dir(prev_cwd).expect("restore cwd");
         result.expect("plan-only push");
 
         assert_eq!(validation_call_count(), 0);

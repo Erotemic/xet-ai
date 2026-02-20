@@ -293,3 +293,19 @@ This pass felt like moving from “feature correctness” toward “operational 
 The transaction work was the most important conceptual cleanup: live refs should be downstream of published payload existence, never the other way around. Enforcing that in code structure (not just comments) made the crash model much easier to reason about.
 
 I also noticed how easy it is for tests to pass while asserting the wrong directory shape (plan-only remote writes under repo-id prefixes). Tightening those assertions made me more confident the dry-run contract is genuinely enforced, not accidentally untested.
+
+## 2026-02-20 (commit: pending) — Final alpha-flake sweep: cwd independence + stronger non-mutation proofs
+
+### What changed
+- Refactored push orchestration to introduce an internal `push_in_repo(&Path, ...)` entrypoint so tests can execute push logic without mutating global process CWD.
+- Updated plan-only tests to call `push_in_repo` directly and removed `std::env::set_current_dir(...)` usage from command tests, eliminating CWD race/flakiness in parallel test execution.
+- Tightened plan-only non-mutation assertions to include remote-root emptiness checks and explicit repo-id absence checks so tests cannot pass when writes occur under nested remote prefixes.
+- Normalized newline string literals to explicit escaped forms (`"\n"`, `b"...\n"`) in finalize/staging and related tests to remove formatting artifacts and keep semantics explicit.
+- Kept single test module structure per file and retained trust-invariant coverage for verified transfer behavior, crash-safe transaction publishing, and validation workspace hygiene.
+
+### State of mind / reflections
+This patch felt like removing the last class of “false confidence” bugs. The hardest issues were not algorithmic—they were test assumptions that could accidentally mask regressions (especially around remote root layout and global cwd side effects). By making tests less magical and more explicit, the safety claims now feel materially stronger.
+
+I’m particularly happy with moving tests off global CWD mutation. Even when protected by a mutex, global state in tests tends to become a latent source of flakes over time. `push_in_repo` gives us a cleaner seam that is both more testable and more maintainable.
+
+At this stage, the codebase feels much closer to alpha-pilot quality: not because every edge case is solved, but because the highest-risk invariants are now encoded in fast, focused tests that should fail loudly if anything drifts.
