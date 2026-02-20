@@ -104,6 +104,13 @@ fn new_validation_base(repo_root: &Path, sha: &str) -> PathBuf {
         .join(Uuid::new_v4().to_string())
 }
 
+fn prepare_validation_workspace(repo_root: &Path, sha: &str) -> Result<(PathBuf, PathBuf)> {
+    let val_base = new_validation_base(repo_root, sha);
+    let val_cas = val_base.join("xet");
+    fs::create_dir_all(&val_cas)?;
+    Ok((val_base, val_cas))
+}
+
 async fn validate_minimal_plan(
     repo_root: &Path,
     sha: &str,
@@ -116,10 +123,8 @@ async fn validate_minimal_plan(
         return Ok(true);
     };
 
-    let val_base = new_validation_base(repo_root, sha);
-    let val_cas = val_base.join("xet");
+    let (val_base, val_cas) = prepare_validation_workspace(repo_root, sha)?;
     let local_cas = repo_root.join(".xet_ai").join("xet");
-    fs::create_dir_all(&val_cas)?;
 
     for relpath in relpaths {
         let src = local_cas.join(relpath);
@@ -748,16 +753,64 @@ fn stage_transaction(store: &dyn RemoteStore, tx: &TransactionArtifacts) -> Resu
     Ok(())
 }
 
-fn finalize_transaction(store: &dyn RemoteStore, tx: &TransactionArtifacts) -> Result<()> {
+fn finalize_write_payloads(store: &dyn RemoteStore, tx: &TransactionArtifacts) -> Result<()> {
     store.write_bytes_atomic(&format!("manifests/{}.json", tx.git_sha), &tx.manifest_json)?;
     store.write_bytes_atomic(&format!("pointers/{}.json", tx.git_sha), &tx.pointer_json)?;
+    Ok(())
+}
+
+fn finalize_update_live_refs(store: &dyn RemoteStore, tx: &TransactionArtifacts) -> Result<()> {
+    if !store.exists(&format!("manifests/{}.json", tx.git_sha))?
+        || !store.exists(&format!("pointers/{}.json", tx.git_sha))?
+    {
+        bail!(
+            "transaction payload missing for {}; refusing to update live refs",
+            tx.git_sha
+        );
+    }
     store.write_bytes_atomic(
         &format!("refs/{}", tx.refname),
-        format!("{}\n", tx.git_sha).as_bytes(),
+        format!(
+            "{}
+",
+            tx.git_sha
+        )
+        .as_bytes(),
     )?;
-    store.write_bytes_atomic("manifests/HEAD", format!("{}\n", tx.git_sha).as_bytes())?;
-    store.write_bytes_atomic("pointers/HEAD", format!("{}\n", tx.git_sha).as_bytes())?;
-    store.write_bytes_atomic(&format!("tx/PUBLISHED/{}", tx.txid), b"published\n")?;
+    store.write_bytes_atomic(
+        "manifests/HEAD",
+        format!(
+            "{}
+",
+            tx.git_sha
+        )
+        .as_bytes(),
+    )?;
+    store.write_bytes_atomic(
+        "pointers/HEAD",
+        format!(
+            "{}
+",
+            tx.git_sha
+        )
+        .as_bytes(),
+    )?;
+    Ok(())
+}
+
+fn finalize_mark_published(store: &dyn RemoteStore, tx: &TransactionArtifacts) -> Result<()> {
+    store.write_bytes_atomic(
+        &format!("tx/PUBLISHED/{}", tx.txid),
+        b"published
+",
+    )?;
+    Ok(())
+}
+
+fn finalize_transaction(store: &dyn RemoteStore, tx: &TransactionArtifacts) -> Result<()> {
+    finalize_write_payloads(store, tx)?;
+    finalize_update_live_refs(store, tx)?;
+    finalize_mark_published(store, tx)?;
     Ok(())
 }
 
@@ -997,6 +1050,8 @@ mod tests {
     use std::path::Path as StdPath;
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
+    static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn noop_waker() -> Waker {
         unsafe fn clone(_: *const ()) -> RawWaker {
             RawWaker::new(std::ptr::null(), &VTABLE)
@@ -1102,6 +1157,67 @@ mod tests {
     }
 
     #[test]
+    fn finalize_refuses_live_ref_updates_when_payload_missing() {
+        let root = std::env::temp_dir().join(format!("xet-ai-finalize-{}", Uuid::new_v4()));
+        let store = FilesystemRemoteStore::new(root.clone());
+        let tx = TransactionArtifacts {
+            txid: "tx2".to_string(),
+            git_sha: "abcdef0123456789abcdef0123456789abcdef01".to_string(),
+            refname: "main".to_string(),
+            manifest_json: b"{}".to_vec(),
+            pointer_json: b"{}".to_vec(),
+        };
+
+        let err = finalize_update_live_refs(&store, &tx).expect_err("must fail without payload");
+        assert!(err.to_string().contains("payload missing"));
+        assert!(!store.exists("refs/main").expect("refs absent"));
+        assert!(!store.exists("manifests/HEAD").expect("head absent"));
+        assert!(!store.exists("tx/PUBLISHED/tx2").expect("published absent"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn crash_before_finalize_keeps_live_refs_unchanged() {
+        let root = std::env::temp_dir().join(format!("xet-ai-crash-{}", Uuid::new_v4()));
+        let store = FilesystemRemoteStore::new(root.clone());
+        let tx = TransactionArtifacts {
+            txid: "tx3".to_string(),
+            git_sha: "fedcba9876543210fedcba9876543210fedcba98".to_string(),
+            refname: "main".to_string(),
+            manifest_json: b"{}".to_vec(),
+            pointer_json: b"{}".to_vec(),
+        };
+
+        stage_transaction(&store, &tx).expect("stage");
+        assert!(store.exists("tx/STAGED/tx3").expect("staged"));
+        assert!(!store.exists("refs/main").expect("refs absent"));
+        assert!(!store.exists("manifests/HEAD").expect("head absent"));
+        assert!(!store.exists("tx/PUBLISHED/tx3").expect("published absent"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prepare_validation_workspace_ignores_dirty_previous_dirs() {
+        let root = std::env::temp_dir().join(format!("xet-ai-validate-clean-{}", Uuid::new_v4()));
+        let dirty = root
+            .join(".xet_ai")
+            .join("validate")
+            .join("sha")
+            .join("dirty-run");
+        std::fs::create_dir_all(dirty.join("xet")).expect("dirty dir");
+        std::fs::write(dirty.join("xet").join("sentinel"), b"stale").expect("sentinel");
+
+        let (active, active_cas) = prepare_validation_workspace(&root, "sha").expect("prepare");
+        assert_ne!(active, dirty);
+        assert!(active_cas.exists());
+        assert!(!active_cas.join("sentinel").exists());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn track_updates_gitattributes_without_duplicates() {
         let root = std::env::temp_dir().join(format!("xet-ai-track-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).expect("root");
@@ -1181,6 +1297,7 @@ mod tests {
         config::save_shared(&root, &shared).expect("save cfg");
         std::fs::create_dir_all(root.join(".xet_ai").join("xet")).expect("local cas");
 
+        let _cwd_guard = CWD_LOCK.lock().expect("cwd lock");
         let prev_cwd = std::env::current_dir().expect("cwd");
         std::env::set_current_dir(&root).expect("chdir");
 
@@ -1196,10 +1313,80 @@ mod tests {
         std::env::set_current_dir(prev_cwd).expect("restore cwd");
         result.expect("plan-only push");
 
-        assert!(!remote_root.join("tx").exists());
-        assert!(!remote_root.join("manifests").exists());
-        assert!(!remote_root.join("refs").exists());
-        assert!(!remote_root.join("pointers").exists());
+        let repo_id = "repo-id";
+        assert!(!remote_root.join(repo_id).exists());
+        assert!(std::fs::read_dir(&remote_root)
+            .expect("read remote root")
+            .next()
+            .is_none());
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(remote_root);
+    }
+
+    #[test]
+    fn push_plan_only_does_not_create_remote_artifact_paths_anywhere() {
+        let (root, repo) = init_repo();
+        let remote_root = std::env::temp_dir().join(format!("xet-ai-remote-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&remote_root).expect("remote root");
+
+        let pointer_json =
+            br#"{"hash":"0123456789abcdef0123456789abcdef01234567","file_size":123}"#;
+        let _sha = commit_files(&repo, &[("big.bin", pointer_json)], "pointer commit");
+
+        std::fs::write(
+            root.join(repo::REPO_ID_FILE),
+            "repo-id
+",
+        )
+        .expect("repo id");
+        let mut shared = ConfigFile::default();
+        shared.default_remote = Some("origin".to_string());
+        shared.remotes.insert(
+            "origin".to_string(),
+            RemoteConfig {
+                r#type: "filesystem".to_string(),
+                path: remote_root.clone(),
+            },
+        );
+        config::save_shared(&root, &shared).expect("save cfg");
+        std::fs::create_dir_all(root.join(".xet_ai").join("xet")).expect("local cas");
+
+        let _cwd_guard = CWD_LOCK.lock().expect("cwd lock");
+        let prev_cwd = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("chdir");
+        let result = block_on_ready(push(
+            Some("origin"),
+            Some("main"),
+            false,
+            PushMode::MinimalValidate,
+            true,
+            false,
+        ));
+        std::env::set_current_dir(prev_cwd).expect("restore cwd");
+        result.expect("plan-only push");
+
+        let forbidden = ["tx", "manifests", "refs", "pointers"];
+        for entry in walkdir::WalkDir::new(&remote_root)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            let rel = entry
+                .path()
+                .strip_prefix(&remote_root)
+                .expect("strip prefix");
+            if rel.as_os_str().is_empty() {
+                continue;
+            }
+            let rels = rel.to_string_lossy();
+            assert!(
+                !forbidden
+                    .iter()
+                    .any(|n| rels.split('/').any(|part| part == *n)),
+                "unexpected remote artifact path in plan-only run: {}",
+                rels
+            );
+        }
 
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(remote_root);
@@ -1235,6 +1422,7 @@ mod tests {
 
         reset_validation_call_count();
 
+        let _cwd_guard = CWD_LOCK.lock().expect("cwd lock");
         let prev_cwd = std::env::current_dir().expect("cwd");
         std::env::set_current_dir(&root).expect("chdir");
         let result = block_on_ready(push(

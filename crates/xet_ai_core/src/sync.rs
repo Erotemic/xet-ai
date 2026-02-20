@@ -944,6 +944,100 @@ mod tests {
     }
 
     #[test]
+    fn verified_pull_detects_remote_corruption_same_size() {
+        let root = std::env::temp_dir().join(format!("xet-ai-pull-verify-{}", Uuid::new_v4()));
+        let local = root.join("local");
+        let remote = root.join("remote");
+        fs::create_dir_all(local.join("xet/cas")).expect("local dirs");
+        fs::create_dir_all(remote.join("xet/cas")).expect("remote dirs");
+
+        let remote_file = remote.join("xet/cas/a.bin");
+        fs::write(&remote_file, b"hello").expect("write remote");
+        let sha = sha256_file(&remote_file).expect("hash");
+        fs::write(&remote_file, b"jello").expect("corrupt same size");
+
+        let store = crate::remote::FilesystemRemoteStore::new(remote.clone());
+        let err = copy_remote_to_local_atomic_verified(
+            &store,
+            "xet/cas/a.bin",
+            &local.join("xet/cas/a.bin"),
+            5,
+            &sha,
+            VerifyPolicy::default(),
+        )
+        .expect_err("must fail hash mismatch on pull");
+        assert!(err.to_string().contains("hash"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn verified_pull_detects_remote_corruption_truncated() {
+        let root = std::env::temp_dir().join(format!("xet-ai-pull-size-{}", Uuid::new_v4()));
+        let local = root.join("local");
+        let remote = root.join("remote");
+        fs::create_dir_all(local.join("xet/cas")).expect("local dirs");
+        fs::create_dir_all(remote.join("xet/cas")).expect("remote dirs");
+
+        let remote_file = remote.join("xet/cas/a.bin");
+        fs::write(&remote_file, b"hello").expect("write remote");
+        let sha = sha256_file(&remote_file).expect("hash");
+        fs::write(&remote_file, b"hell").expect("truncate");
+
+        let store = crate::remote::FilesystemRemoteStore::new(remote.clone());
+        let err = copy_remote_to_local_atomic_verified(
+            &store,
+            "xet/cas/a.bin",
+            &local.join("xet/cas/a.bin"),
+            5,
+            &sha,
+            VerifyPolicy::default(),
+        )
+        .expect_err("must fail size mismatch on pull");
+        assert!(err.to_string().contains("size"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn verified_copy_does_not_overwrite_existing_correct_file() {
+        let root = std::env::temp_dir().join(format!("xet-ai-immut-{}", Uuid::new_v4()));
+        let local = root.join("local");
+        let remote = root.join("remote");
+        fs::create_dir_all(local.join("xet/cas")).expect("local dirs");
+        fs::create_dir_all(remote.join("xet/cas")).expect("remote dirs");
+
+        let local_file = local.join("xet/cas/a.bin");
+        let remote_file = remote.join("xet/cas/a.bin");
+        fs::write(&local_file, b"hello").expect("write local");
+        fs::write(&remote_file, b"hello").expect("write remote");
+        let before = fs::metadata(&remote_file)
+            .expect("meta")
+            .modified()
+            .expect("mtime");
+        let sha = sha256_file(&local_file).expect("hash");
+
+        let store = crate::remote::FilesystemRemoteStore::new(remote.clone());
+        let copied = copy_local_to_remote_atomic_verified(
+            &local_file,
+            &store,
+            "xet/cas/a.bin",
+            5,
+            &sha,
+            VerifyPolicy::default(),
+        )
+        .expect("copy");
+        assert_eq!(copied, 0);
+        let after = fs::metadata(&remote_file)
+            .expect("meta")
+            .modified()
+            .expect("mtime");
+        assert_eq!(before, after);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn lock_acquire_release() {
         let root = std::env::temp_dir().join(format!("xet-ai-lock-test-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).expect("create root");

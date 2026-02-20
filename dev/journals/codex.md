@@ -276,3 +276,20 @@ This iteration was mostly about trust boundaries and user expectation management
 The doctor cleanup had a similar theme: diagnostics should reflect operator reality, not implementation internals. The previous parser check was logically true but practically useless. Swapping it for concrete repo/remote/filter checks makes the command much more actionable during onboarding and outage debugging.
 
 I also felt the tension between “fast tests” and “high-confidence behavior.” The added tests intentionally stay narrow and local (temp dirs + git2), but they now pin down the two core promises that matter for this sprint: plan-only should not mutate remotes, and plan-only should not trigger validation unless explicitly asked.
+
+## 2026-02-20 (commit: pending) — Acceptance blocker hardening: verified copy coverage + finalize invariants
+
+### What changed
+- Expanded fast verification/immutability coverage with additional unit tests for pull-side corruption detection (same-size hash mismatch and truncation size mismatch) and non-overwrite semantics when destination is already correct.
+- Strengthened transaction-finalize invariants by splitting finalize into explicit phases and adding a precondition guard that refuses live ref/HEAD updates if final manifest/pointer payloads are not present.
+- Added crash-safety tests for staged-but-not-finalized pushes and for attempted live-ref updates without finalized payloads.
+- Added validation workspace setup helper and a dedicated test proving stale files in previous validate directories are not used by new validation runs.
+- Hardened plan-only regression tests so they assert true no-mutation at remote root/repo-id scope and walk the remote tree for forbidden artifact path creation.
+- Installed and executed `shellcheck` locally so script linting now participates in the full local acceptance run.
+
+### State of mind / reflections
+This pass felt like moving from “feature correctness” toward “operational certainty.” Most of the risky bugs here are not obvious in happy-path demos; they show up after crashes, retries, or silent data drift. I wanted the tests to encode those failure modes directly so future refactors don’t regress safety promises.
+
+The transaction work was the most important conceptual cleanup: live refs should be downstream of published payload existence, never the other way around. Enforcing that in code structure (not just comments) made the crash model much easier to reason about.
+
+I also noticed how easy it is for tests to pass while asserting the wrong directory shape (plan-only remote writes under repo-id prefixes). Tightening those assertions made me more confident the dry-run contract is genuinely enforced, not accidentally untested.
