@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{Cursor, Read};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
@@ -12,12 +12,18 @@ pub struct RemoteCapabilities {
     pub supports_list_prefix: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct RemoteStat {
+    pub size: u64,
+}
+
 pub trait RemoteStore {
     fn capabilities(&self) -> RemoteCapabilities;
+    fn stat(&self, remote_relpath: &str) -> Result<Option<RemoteStat>>;
     fn read_bytes(&self, remote_relpath: &str) -> Result<Option<Vec<u8>>>;
     fn write_bytes_atomic(&self, remote_relpath: &str, bytes: &[u8]) -> Result<()>;
     fn exists(&self, remote_relpath: &str) -> Result<bool>;
-    fn open_reader(&self, remote_relpath: &str) -> Result<Box<dyn Read>>;
+    fn open_reader(&self, remote_relpath: &str) -> Result<Box<dyn Read + Send>>;
     fn copy_from_local_atomic(&self, local_path: &Path, remote_relpath: &str) -> Result<()>;
     fn copy_to_local_atomic(&self, remote_relpath: &str, local_path: &Path) -> Result<()>;
     fn list_prefix(&self, prefix: &str) -> Result<Vec<String>>;
@@ -105,6 +111,15 @@ impl RemoteStore for FilesystemRemoteStore {
         }
     }
 
+    fn stat(&self, remote_relpath: &str) -> Result<Option<RemoteStat>> {
+        let p = self.abs(remote_relpath);
+        if !p.exists() {
+            return Ok(None);
+        }
+        let size = fs::metadata(p)?.len();
+        Ok(Some(RemoteStat { size }))
+    }
+
     fn read_bytes(&self, remote_relpath: &str) -> Result<Option<Vec<u8>>> {
         let p = self.abs(remote_relpath);
         if !p.exists() {
@@ -121,11 +136,12 @@ impl RemoteStore for FilesystemRemoteStore {
         Ok(self.abs(remote_relpath).exists())
     }
 
-    fn open_reader(&self, remote_relpath: &str) -> Result<Box<dyn Read>> {
-        let b = self
-            .read_bytes(remote_relpath)?
-            .ok_or_else(|| anyhow!("remote path missing: {remote_relpath}"))?;
-        Ok(Box::new(Cursor::new(b)))
+    fn open_reader(&self, remote_relpath: &str) -> Result<Box<dyn Read + Send>> {
+        let p = self.abs(remote_relpath);
+        if !p.exists() {
+            return Err(anyhow!("remote path missing: {remote_relpath}"));
+        }
+        Ok(Box::new(std::fs::File::open(p)?))
     }
 
     fn copy_from_local_atomic(&self, local_path: &Path, remote_relpath: &str) -> Result<()> {

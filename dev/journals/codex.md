@@ -309,3 +309,23 @@ This patch felt like removing the last class of “false confidence” bugs. The
 I’m particularly happy with moving tests off global CWD mutation. Even when protected by a mutex, global state in tests tends to become a latent source of flakes over time. `push_in_repo` gives us a cleaner seam that is both more testable and more maintainable.
 
 At this stage, the codebase feels much closer to alpha-pilot quality: not because every edge case is solved, but because the highest-risk invariants are now encoded in fast, focused tests that should fail loudly if anything drifts.
+
+## 2026-02-20 (commit: pending) — Streaming remote verification + strict minimal-manifest missing-object handling
+
+### What changed
+- Extended `RemoteStore` with lightweight metadata (`stat`) and true streaming reads (`open_reader` returning `Read + Send`) so verification logic no longer depends on full-buffer remote reads.
+- Updated `FilesystemRemoteStore` to implement streaming reads via `File::open` and metadata via `fs::metadata().len()`.
+- Reworked remote verification to use `stat` for size checks always and stream-hash only when object size is below `HASH_VERIFY_LIMIT`.
+- Added `missing_required_relpaths(...)` and made subset manifest building fail on missing requested relpaths instead of silently skipping them.
+- Updated push minimal-mode behavior to handle missing required CAS objects safely:
+  - minimal+validate: explicit warning + fallback to all-cas,
+  - minimal-no-validate: hard error to prevent inconsistent publish,
+  - plan-only: reports missing-required count in summary without touching remote.
+- Added regression tests for streaming verification behavior (large files avoid reader consumption, small files stream-hash bytes), and for strict missing-relpath handling in minimal-manifest inputs.
+
+### State of mind / reflections
+This was the most important scalability fix left for alpha. Reading remote blobs into memory for verification is fine for toy data and disastrous for real CAS workloads. Moving verification to metadata + streaming is not just a perf tweak; it is the abstraction we need before HTTP/S3 backends are credible.
+
+I also wanted to close the “silent drop” loophole in minimal manifest generation. Silent skipping of required relpaths is dangerous because it creates success-shaped failures. Converting that into explicit fallback/error paths makes operator behavior predictable and safer.
+
+Remaining risk for alpha is mostly around backend diversity: filesystem behavior is now much healthier, but network remotes will still need careful tuning for latency and retries. The key upside is that the trait surface now supports those implementations without reworking correctness logic again.

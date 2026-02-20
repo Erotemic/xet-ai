@@ -842,8 +842,28 @@ async fn push_in_repo(
         &mut hydrator,
     )?;
 
+    let missing_required =
+        sync::missing_required_relpaths(&local_cas_root, &plan.required_cas_relpaths);
+    if !missing_required.is_empty() {
+        eprintln!(
+            "xet-ai: warning: minimal reachability is missing local CAS object(s): {}",
+            missing_required.join(", ")
+        );
+        if mode == PushMode::MinimalNoValidate {
+            bail!(
+                "Local CAS missing required object(s) for minimal manifest; cannot publish consistent state."
+            );
+        }
+    }
+
     let mut used_all_cas = mode == PushMode::AllCas;
     let should_validate = mode == PushMode::MinimalValidate && (!plan_only || plan_validate);
+    if mode == PushMode::MinimalValidate && !missing_required.is_empty() {
+        eprintln!(
+            "xet-ai: warning: minimal manifest inputs incomplete; falling back to --all-cas for this push"
+        );
+        used_all_cas = true;
+    }
     if should_validate {
         let ok = validate_minimal_plan(
             repo_root,
@@ -879,9 +899,10 @@ async fn push_in_repo(
 
     if plan_only {
         println!(
-            "plan-only: mode={} validated={} pointer_files={} required_cas_files={} manifest_entries={} manifest_bytes={}",
+            "plan-only: mode={} validated={} missing_required_cas_files={} pointer_files={} required_cas_files={} manifest_entries={} manifest_bytes={}",
             if used_all_cas { "all-cas" } else { "minimal" },
             should_validate,
+            missing_required.len(),
             plan.pointer_paths.len(),
             plan.required_cas_relpaths.len(),
             manifest.entries.len(),
@@ -1405,6 +1426,42 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(remote_root);
+    }
+
+    #[test]
+    fn build_manifest_for_relpaths_errors_on_missing_required_object() {
+        let root = std::env::temp_dir().join(format!("xet-ai-manifest-miss-{}", Uuid::new_v4()));
+        let cas = root.join("cas");
+        std::fs::create_dir_all(&cas).expect("cas");
+        let cache = root.join("hash_cache.json");
+
+        let err = sync::build_manifest_for_relpaths(
+            "repo",
+            "sha",
+            &cas,
+            &cache,
+            &["cas/missing.bin".to_string()],
+        )
+        .expect_err("must fail on missing required relpath");
+        assert!(err.to_string().contains("missing local CAS object"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_required_relpaths_reports_missing_entries() {
+        let root = std::env::temp_dir().join(format!("xet-ai-missing-list-{}", Uuid::new_v4()));
+        let cas = root.join("cas");
+        std::fs::create_dir_all(cas.join("cas")).expect("cas dirs");
+        std::fs::write(cas.join("cas/present.bin"), b"ok").expect("write");
+
+        let missing = sync::missing_required_relpaths(
+            &cas,
+            &["cas/present.bin".to_string(), "cas/missing.bin".to_string()],
+        );
+        assert_eq!(missing, vec!["cas/missing.bin".to_string()]);
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

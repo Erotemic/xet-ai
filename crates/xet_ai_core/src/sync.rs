@@ -115,10 +115,14 @@ pub fn describe_cas_tree(cas_root: &Path) -> Result<Vec<(String, bool)>> {
 
 pub fn sha256_file(path: &Path) -> Result<String> {
     let mut file = File::open(path)?;
+    sha256_reader(&mut file)
+}
+
+fn sha256_reader(reader: &mut dyn Read) -> Result<String> {
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 1024 * 1024];
     loop {
-        let n = file.read(&mut buf)?;
+        let n = reader.read(&mut buf)?;
         if n == 0 {
             break;
         }
@@ -218,6 +222,15 @@ pub fn build_manifest_for_relpaths(
     )
 }
 
+pub fn missing_required_relpaths(cas_root: &Path, relpaths: &[String]) -> Vec<String> {
+    relpaths
+        .iter()
+        .filter(|relpath| sync_included(Path::new(relpath)))
+        .filter(|relpath| !cas_root.join(relpath).exists())
+        .cloned()
+        .collect()
+}
+
 fn build_manifest_with_hasher(
     repo_id: &str,
     git_sha: &str,
@@ -238,7 +251,7 @@ fn build_manifest_with_hasher(
             }
             let abs = cas_root.join(relpath);
             if !abs.exists() {
-                continue;
+                bail!("missing local CAS object for required relpath: {}", relpath);
             }
 
             let size = fs::metadata(&abs)?.len();
@@ -520,20 +533,20 @@ fn verify_existing_remote(
     expected_sha256: &str,
     policy: VerifyPolicy,
 ) -> Result<bool> {
-    let Some(bytes) = remote_store.read_bytes(remote_relpath)? else {
+    let Some(stat) = remote_store.stat(remote_relpath)? else {
         return Ok(false);
     };
-    let size = bytes.len() as u64;
-    if size != expected_size {
+    if stat.size != expected_size {
         bail!(
             "destination corruption detected: {} has size {}, expected {}",
             remote_relpath,
-            size,
+            stat.size,
             expected_size
         );
     }
     if expected_size <= policy.hash_verify_limit {
-        let got = format!("{:x}", Sha256::digest(&bytes));
+        let mut reader = remote_store.open_reader(remote_relpath)?;
+        let got = sha256_reader(&mut *reader)?;
         if got != expected_sha256 {
             bail!(
                 "destination hash mismatch: {} expected {} got {}",
@@ -1035,6 +1048,141 @@ mod tests {
         assert_eq!(before, after);
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct MockReaderStats {
+        total_read: Arc<Mutex<u64>>,
+    }
+
+    struct CountingReader {
+        inner: std::io::Cursor<Vec<u8>>,
+        stats: MockReaderStats,
+    }
+
+    impl Read for CountingReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            let mut total = self.stats.total_read.lock().expect("lock stats");
+            *total += n as u64;
+            Ok(n)
+        }
+    }
+
+    struct MockRemoteStore {
+        files: std::collections::BTreeMap<String, Vec<u8>>,
+        stats: MockReaderStats,
+    }
+
+    impl MockRemoteStore {
+        fn new(files: std::collections::BTreeMap<String, Vec<u8>>) -> Self {
+            Self {
+                files,
+                stats: MockReaderStats {
+                    total_read: Arc::new(Mutex::new(0)),
+                },
+            }
+        }
+
+        fn bytes_read(&self) -> u64 {
+            *self.stats.total_read.lock().expect("lock stats")
+        }
+    }
+
+    impl crate::remote::RemoteStore for MockRemoteStore {
+        fn capabilities(&self) -> crate::remote::RemoteCapabilities {
+            crate::remote::RemoteCapabilities {
+                supports_locking: false,
+                supports_list_prefix: false,
+            }
+        }
+
+        fn stat(&self, remote_relpath: &str) -> Result<Option<crate::remote::RemoteStat>> {
+            Ok(self
+                .files
+                .get(remote_relpath)
+                .map(|v| crate::remote::RemoteStat {
+                    size: v.len() as u64,
+                }))
+        }
+
+        fn read_bytes(&self, remote_relpath: &str) -> Result<Option<Vec<u8>>> {
+            Ok(self.files.get(remote_relpath).cloned())
+        }
+
+        fn write_bytes_atomic(&self, _remote_relpath: &str, _bytes: &[u8]) -> Result<()> {
+            bail!("not implemented in mock")
+        }
+
+        fn exists(&self, remote_relpath: &str) -> Result<bool> {
+            Ok(self.files.contains_key(remote_relpath))
+        }
+
+        fn open_reader(&self, remote_relpath: &str) -> Result<Box<dyn Read + Send>> {
+            let bytes = self
+                .files
+                .get(remote_relpath)
+                .cloned()
+                .ok_or_else(|| anyhow!("missing"))?;
+            Ok(Box::new(CountingReader {
+                inner: std::io::Cursor::new(bytes),
+                stats: self.stats.clone(),
+            }))
+        }
+
+        fn copy_from_local_atomic(&self, _local_path: &Path, _remote_relpath: &str) -> Result<()> {
+            bail!("not implemented in mock")
+        }
+
+        fn copy_to_local_atomic(&self, _remote_relpath: &str, _local_path: &Path) -> Result<()> {
+            bail!("not implemented in mock")
+        }
+
+        fn list_prefix(&self, _prefix: &str) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn verify_existing_remote_skips_hash_stream_for_large_objects() {
+        let mut files = std::collections::BTreeMap::new();
+        files.insert("xet/cas/a.bin".to_string(), vec![7u8; 4 * 1024 * 1024]);
+        let store = MockRemoteStore::new(files);
+        let ok = verify_existing_remote(
+            &store,
+            "xet/cas/a.bin",
+            4 * 1024 * 1024,
+            "unused",
+            VerifyPolicy {
+                hash_verify_limit: 1024 * 1024,
+            },
+        )
+        .expect("verify");
+        assert!(ok);
+        assert_eq!(store.bytes_read(), 0);
+    }
+
+    #[test]
+    fn verify_existing_remote_stream_hashes_small_objects() {
+        let payload = b"hello".to_vec();
+        let mut files = std::collections::BTreeMap::new();
+        files.insert("xet/cas/a.bin".to_string(), payload.clone());
+        let store = MockRemoteStore::new(files);
+        let expected = format!("{:x}", Sha256::digest(&payload));
+        let ok = verify_existing_remote(
+            &store,
+            "xet/cas/a.bin",
+            payload.len() as u64,
+            &expected,
+            VerifyPolicy {
+                hash_verify_limit: 1024 * 1024,
+            },
+        )
+        .expect("verify");
+        assert!(ok);
+        assert_eq!(store.bytes_read(), payload.len() as u64);
     }
 
     #[test]
