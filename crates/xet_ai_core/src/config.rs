@@ -1,3 +1,8 @@
+//! Configuration loading and merge logic.
+//!
+//! Shared repository config is combined with local machine overrides to
+//! produce an effective runtime configuration used by command handlers.
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -8,6 +13,7 @@ use serde::{Deserialize, Serialize};
 const SHARED_CONFIG_FILE: &str = ".xet_ai.toml";
 const LOCAL_CONFIG_FILE: &str = "config.local.toml";
 
+/// Shared/local configuration file structure.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ConfigFile {
     #[serde(default)]
@@ -16,6 +22,7 @@ pub struct ConfigFile {
     pub auto_pull_on_smudge: Option<bool>,
 }
 
+/// Effective runtime config after shared/local merge.
 #[derive(Debug, Clone)]
 pub struct EffectiveConfig {
     pub remotes: BTreeMap<String, RemoteConfig>,
@@ -23,6 +30,7 @@ pub struct EffectiveConfig {
     pub auto_pull_on_smudge: bool,
 }
 
+/// Remote backend configuration entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteConfig {
     pub r#type: String,

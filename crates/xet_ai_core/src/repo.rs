@@ -1,3 +1,8 @@
+//! Repository bootstrap and path helpers.
+//!
+//! This module owns creation of local `.xet_ai` state and small helpers for
+//! working with repository-relative paths and git-side setup.
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;

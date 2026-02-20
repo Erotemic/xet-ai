@@ -1,3 +1,8 @@
+//! `xet-ai` command-line interface entrypoint.
+//!
+//! CLI parsing lives here, while most behavior is delegated to
+//! `xet_ai_core::commands` and related core modules.
+
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};

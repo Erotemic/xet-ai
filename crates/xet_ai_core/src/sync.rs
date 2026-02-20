@@ -1,3 +1,8 @@
+//! CAS synchronization, manifest management, and transactional publish flows.
+//!
+//! This module contains file-transfer verification logic and safety-critical
+//! publish sequencing used by push/pull orchestration.
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::fs::File;
@@ -12,9 +17,11 @@ use walkdir::WalkDir;
 
 use crate::remote::RemoteStore;
 
+/// Default upper bound (bytes) for hash verification during transfer checks.
 pub const HASH_VERIFY_LIMIT: u64 = 8 * 1024 * 1024;
 const ALLOWLIST_TOP_LEVEL: &[&str] = &["cas", "shards", "mdb", "xorbs", "merkledb"];
 
+/// Verification policy applied when checking existing destination objects.
 #[derive(Debug, Clone, Copy)]
 pub struct VerifyPolicy {
     pub hash_verify_limit: u64,
@@ -28,6 +35,7 @@ impl Default for VerifyPolicy {
     }
 }
 
+/// Aggregate transfer counters produced by sync routines.
 #[derive(Debug, Default)]
 pub struct SyncSummary {
     pub files_copied: u64,
@@ -35,6 +43,7 @@ pub struct SyncSummary {
     pub files_verified: u64,
 }
 
+/// Single manifest row describing a CAS object relpath, size, and SHA-256.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManifestEntry {
     pub relpath: String,
@@ -42,6 +51,7 @@ pub struct ManifestEntry {
     pub sha256: String,
 }
 
+/// Immutable snapshot of object metadata published for a repo/ref state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
     pub repo_id: String,

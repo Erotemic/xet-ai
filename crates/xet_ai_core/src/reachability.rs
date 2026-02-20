@@ -1,3 +1,8 @@
+//! Reachability planning for minimal CAS transfer sets.
+//!
+//! Given a commit and pointer metadata, this module computes CAS relpaths that
+//! are required to hydrate representative pointer data.
+
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 

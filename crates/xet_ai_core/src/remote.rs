@@ -1,3 +1,8 @@
+//! Remote storage abstraction and filesystem backend implementation.
+//!
+//! The `RemoteStore` trait provides the capability surface required by sync and
+//! publish flows while keeping backend-specific details encapsulated.
+
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -6,17 +11,20 @@ use anyhow::{anyhow, Result};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
+/// Feature flags exposed by a remote backend.
 #[derive(Debug, Clone, Copy)]
 pub struct RemoteCapabilities {
     pub supports_locking: bool,
     pub supports_list_prefix: bool,
 }
 
+/// Lightweight metadata returned by [`RemoteStore::stat`].
 #[derive(Debug, Clone, Copy)]
 pub struct RemoteStat {
     pub size: u64,
 }
 
+/// Backend abstraction used by sync and publish flows.
 pub trait RemoteStore {
     fn capabilities(&self) -> RemoteCapabilities;
     fn stat(&self, remote_relpath: &str) -> Result<Option<RemoteStat>>;
@@ -29,6 +37,7 @@ pub trait RemoteStore {
     fn list_prefix(&self, prefix: &str) -> Result<Vec<String>>;
 }
 
+/// Filesystem-backed implementation of [`RemoteStore`].
 #[derive(Debug, Clone)]
 pub struct FilesystemRemoteStore {
     root: PathBuf,

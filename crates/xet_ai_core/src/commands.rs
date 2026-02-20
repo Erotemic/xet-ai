@@ -1,3 +1,9 @@
+//! High-level command orchestration used by the `xet-ai` CLI.
+//!
+//! This module translates user-facing command intents into calls into
+//! repository, reachability, and sync layers while enforcing operational
+//! safety defaults.
+
 use std::cmp::Reverse;
 use std::fs;
 use std::io;

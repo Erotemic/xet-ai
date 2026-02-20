@@ -1,3 +1,8 @@
+//! Pointer index construction and persistence.
+//!
+//! Pointer indices map tracked repo paths to serialized `XetFileInfo` entries
+//! to support planning and validation operations.
+
 use std::fs;
 use std::path::Path;
 

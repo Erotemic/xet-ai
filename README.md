@@ -61,6 +61,11 @@ xet-ai manifest list
 xet-ai manifest verify <sha>
 ```
 
+## Documentation
+
+- [Design overview](docs/design.md)
+- [Tutorial](docs/tutorial.md)
+
 ## Shared vs local config
 
 - Shared/tracked: `.xet_ai.toml`

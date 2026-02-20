@@ -1,3 +1,8 @@
+//! Thin wrappers around git operations used by `xet-ai`.
+//!
+//! The functions in this module keep git-specific details isolated from
+//! higher-level sync and command orchestration code.
+
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
