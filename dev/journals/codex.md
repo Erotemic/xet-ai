@@ -260,3 +260,19 @@ This pass was less about adding brand-new capability and more about making exist
 I also tightened logging consistency because alpha usability is often won or lost in debugging sessions. Consistent `xet-ai:` prefixes make warnings easier to grep and less ambiguous in filter-heavy git command output.
 
 Doctor remains intentionally pragmatic: it catches high-impact misconfigurations without trying to be exhaustive. The new repo-id tracked check addresses a real operational footgun for cloned repos while keeping the command fast.
+
+## 2026-02-20 (commit: pending) — Plan-only semantics hardened + doctor signal quality
+
+### What changed
+- Added `push --validate` so `push --plan-only` can stay fast and side-effect-free by default while still supporting explicit plan-time validation when requested.
+- Refactored push flow so plan/manifest computation occurs before any remote store construction/locking, and plan-only exits before transfer/stage/finalize paths.
+- Reworked doctor into a structured report with meaningful checks: git filter keys (`clean/smudge/required`), tracked-pattern detection in `.gitattributes`, repo-id presence + tracked status, shared config/default-remote visibility, filesystem remote reachability/health hints, and local CAS accessibility + size summary.
+- Removed the previous fake JSON parse check that did not exercise real behavior.
+- Added regression tests for plan-only no-remote-mutation and validation-call skipping, plus a focused doctor-report test for missing-basics signaling.
+
+### State of mind / reflections
+This iteration was mostly about trust boundaries and user expectation management. `--plan-only` sounds like a dry-run, so any hidden hydration/validation work or remote touching feels like a contract violation even if technically "safe." I wanted the code shape to make that guarantee obvious, not accidental.
+
+The doctor cleanup had a similar theme: diagnostics should reflect operator reality, not implementation internals. The previous parser check was logically true but practically useless. Swapping it for concrete repo/remote/filter checks makes the command much more actionable during onboarding and outage debugging.
+
+I also felt the tension between “fast tests” and “high-confidence behavior.” The added tests intentionally stay narrow and local (temp dirs + git2), but they now pin down the two core promises that matter for this sprint: plan-only should not mutate remotes, and plan-only should not trigger validation unless explicitly asked.

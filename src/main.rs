@@ -45,8 +45,10 @@ enum Commands {
         name: Option<String>,
         #[arg(long = "ref")]
         refname: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "Compute push plan without writing remote data")]
         plan_only: bool,
+        #[arg(long, help = "Run minimal validation even with --plan-only")]
+        validate: bool,
         #[arg(long)]
         force_lock: bool,
         #[arg(long)]
@@ -168,6 +170,7 @@ async fn run() -> Result<()> {
             name,
             refname,
             plan_only,
+            validate,
             force_lock,
             all_cas,
             minimal_no_validate,
@@ -185,6 +188,7 @@ async fn run() -> Result<()> {
                 force_lock,
                 mode,
                 plan_only,
+                validate,
             )
             .await
         }

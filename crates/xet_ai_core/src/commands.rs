@@ -82,6 +82,20 @@ fn choose_representative_pointer(idx: &PointerIndex) -> Option<XetFileInfo> {
     entries.first().map(|e| e.file_info.clone())
 }
 
+#[cfg(test)]
+static VALIDATE_MINIMAL_PLAN_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+fn validation_call_count() -> usize {
+    VALIDATE_MINIMAL_PLAN_CALLS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(test)]
+fn reset_validation_call_count() {
+    VALIDATE_MINIMAL_PLAN_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
 fn new_validation_base(repo_root: &Path, sha: &str) -> PathBuf {
     repo_root
         .join(".xet_ai")
@@ -96,6 +110,8 @@ async fn validate_minimal_plan(
     relpaths: &[String],
     idx: &PointerIndex,
 ) -> Result<bool> {
+    #[cfg(test)]
+    VALIDATE_MINIMAL_PLAN_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let Some(ptr) = choose_representative_pointer(idx) else {
         return Ok(true);
     };
@@ -275,75 +291,181 @@ pub fn status() -> Result<()> {
     Ok(())
 }
 
-pub fn doctor() -> Result<()> {
-    let repo_root = repo::repo_root()?;
-    let mut ok = true;
+#[derive(Debug, Default)]
+struct DoctorReport {
+    critical_issues: Vec<String>,
+    warnings: Vec<String>,
+    cas_bytes_approx: u64,
+}
+
+impl DoctorReport {
+    fn warn(&mut self, message: impl Into<String>) {
+        self.warnings.push(message.into());
+    }
+
+    fn critical(&mut self, message: impl Into<String>) {
+        self.critical_issues.push(message.into());
+    }
+
+    fn is_ok(&self) -> bool {
+        self.critical_issues.is_empty()
+    }
+}
+
+fn collect_doctor_report(repo_root: &Path) -> Result<DoctorReport> {
+    let mut report = DoctorReport::default();
 
     let checks = [
-        ("filter.clean", ["config", "--get", "filter.xet_ai.clean"]),
-        ("filter.smudge", ["config", "--get", "filter.xet_ai.smudge"]),
+        (
+            "filter.xet_ai.clean",
+            ["config", "--get", "filter.xet_ai.clean"],
+        ),
+        (
+            "filter.xet_ai.smudge",
+            ["config", "--get", "filter.xet_ai.smudge"],
+        ),
+        (
+            "filter.xet_ai.required",
+            ["config", "--get", "filter.xet_ai.required"],
+        ),
     ];
     for (name, args) in checks {
         let status = std::process::Command::new("git")
-            .current_dir(&repo_root)
+            .current_dir(repo_root)
             .args(args)
             .output()?;
         if !status.status.success() {
-            eprintln!("xet-ai: missing git {}", name);
-            ok = false;
+            report.critical(format!("xet-ai: missing git config {name}"));
         }
     }
 
-    let repo_id_path = repo::repo_id_path(&repo_root);
-    if !repo_id_path.exists() {
-        eprintln!("xet-ai: missing {}", repo::REPO_ID_FILE);
-        ok = false;
+    let gitattributes = repo_root.join(".gitattributes");
+    let tracked = if gitattributes.exists() {
+        fs::read_to_string(&gitattributes)?
+            .lines()
+            .any(|l| l.contains("filter=xet_ai"))
     } else {
-        let tracked = std::process::Command::new("git")
-            .current_dir(&repo_root)
+        false
+    };
+    if !tracked {
+        report.warn(
+            "xet-ai: no tracked patterns found in .gitattributes (run `xet-ai track \"*.bin\"`)"
+                .to_string(),
+        );
+    }
+
+    let repo_id_path = repo::repo_id_path(repo_root);
+    if !repo_id_path.exists() {
+        report.critical(format!("xet-ai: missing {}", repo::REPO_ID_FILE));
+    } else {
+        let tracked_repo_id = std::process::Command::new("git")
+            .current_dir(repo_root)
             .args(["ls-files", "--error-unmatch", repo::REPO_ID_FILE])
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false);
-        if !tracked {
-            eprintln!(
+        if !tracked_repo_id {
+            report.warn(format!(
                 "xet-ai: warning: {} is not committed; commit it so clones share identity",
                 repo::REPO_ID_FILE
-            );
+            ));
         }
     }
 
-    let cfg = EffectiveConfig::load(&repo_root)?;
-    if cfg.default_remote.is_none() {
-        eprintln!("xet-ai: no default remote set");
+    let shared_cfg_path = config::shared_config_path(repo_root);
+    if !shared_cfg_path.exists() {
+        report.warn(format!(
+            "xet-ai: warning: shared config missing at {} (run `xet-ai init --init-config` if desired)",
+            shared_cfg_path.display()
+        ));
     }
 
-    if let Some(def) = cfg.default_remote.as_ref().and_then(|n| cfg.remotes.get(n)) {
+    let cfg = EffectiveConfig::load(repo_root)?;
+    if cfg.default_remote.is_none() {
+        report.warn("xet-ai: warning: no default remote set".to_string());
+    }
+
+    if let Some((name, def)) = cfg
+        .default_remote
+        .as_ref()
+        .and_then(|n| cfg.remotes.get_key_value(n))
+    {
         if def.r#type == "filesystem" {
-            let p = repo::resolve_path(&repo_root, &def.path);
+            let p = repo::resolve_path(repo_root, &def.path);
             if !p.exists() {
-                eprintln!("xet-ai: default remote path not reachable: {}", p.display());
-                ok = false;
+                report.critical(format!(
+                    "xet-ai: default remote path not reachable: {}",
+                    p.display()
+                ));
+            } else {
+                if fs::metadata(&p)
+                    .map(|m| m.permissions().readonly())
+                    .unwrap_or(true)
+                {
+                    report.warn(format!(
+                        "xet-ai: warning: default remote may be read-only: {}",
+                        p.display()
+                    ));
+                }
+                if let Ok(repo_id) = repo::load_repo_id(repo_root) {
+                    let remote_repo_root = p.join(repo_id);
+                    let head = remote_repo_root.join("manifests").join("HEAD");
+                    if !head.exists() {
+                        report.warn(format!(
+                            "xet-ai: warning: default remote `{}` has no manifests/HEAD yet",
+                            name
+                        ));
+                    }
+                    let ref_path = remote_repo_root.join("refs");
+                    if !ref_path.exists() {
+                        report.warn(format!(
+                            "xet-ai: warning: default remote `{}` has no refs/ yet",
+                            name
+                        ));
+                    }
+                }
             }
         }
     }
 
     let cas_root = repo_root.join(".xet_ai").join("xet");
+    if !cas_root.exists() {
+        report.warn(format!(
+            "xet-ai: warning: local CAS root missing at {}",
+            cas_root.display()
+        ));
+    }
     if fs::create_dir_all(&cas_root).is_err() {
-        eprintln!(
+        report.critical(format!(
             "xet-ai: cannot access local CAS root {}",
             cas_root.display()
-        );
-        ok = false;
+        ));
     }
 
-    let passthrough_ok = serde_json::from_slice::<XetFileInfo>(b"not-a-pointer").is_err();
-    if !passthrough_ok {
-        eprintln!("xet-ai: smudge pass-through parser check failed");
-        ok = false;
+    report.cas_bytes_approx = walkdir::WalkDir::new(&cas_root)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .filter_map(|e| e.metadata().ok().map(|m| m.len()))
+        .sum::<u64>();
+
+    Ok(report)
+}
+
+pub fn doctor() -> Result<()> {
+    let repo_root = repo::repo_root()?;
+    let report = collect_doctor_report(&repo_root)?;
+
+    println!("doctor: repo_root={}", repo_root.display());
+    println!("doctor: cas_bytes_approx={}", report.cas_bytes_approx);
+    for w in &report.warnings {
+        eprintln!("{w}");
+    }
+    for c in &report.critical_issues {
+        eprintln!("{c}");
     }
 
-    if ok {
+    if report.is_ok() {
         println!("doctor: OK");
         Ok(())
     } else {
@@ -645,6 +767,7 @@ pub async fn push(
     force_lock: bool,
     mode: PushMode,
     plan_only: bool,
+    plan_validate: bool,
 ) -> Result<()> {
     let repo_root = repo::repo_root()?;
     let cfg = EffectiveConfig::load(&repo_root)?;
@@ -660,32 +783,6 @@ pub async fn push(
     let local_cas_root = xet_ai_root.join("xet");
     let hash_cache_path = xet_ai_root.join("hash_cache.json");
 
-    let store = fs_remote_store(&repo_root, remote, &repo_id)?;
-    let caps = store.capabilities();
-    if !caps.supports_locking {
-        bail!("remote backend does not support push locking");
-    }
-    let _lock_guard = sync::acquire_push_lock(store.root(), force_lock)?;
-
-    if store.capabilities().supports_list_prefix {
-        let stale = store
-            .list_prefix("tx/STAGED")?
-            .into_iter()
-            .filter_map(|p| p.strip_prefix("tx/STAGED/").map(str::to_string))
-            .filter(|txid| {
-                !store
-                    .exists(&format!("tx/PUBLISHED/{txid}"))
-                    .unwrap_or(false)
-            })
-            .collect::<Vec<_>>();
-        if !stale.is_empty() {
-            eprintln!(
-                "xet-ai: warning: found staged transactions from previous pushes: {}",
-                stale.join(", ")
-            );
-        }
-    }
-
     let pointer_index = reachability::load_or_build_pointer_index(&repo_root, &git_sha, &repo_id)?;
     let mut hydrator = PointerHashHydrator::new(&local_cas_root)?;
     let plan = reachability::plan_reachable_cas(
@@ -697,7 +794,8 @@ pub async fn push(
     )?;
 
     let mut used_all_cas = mode == PushMode::AllCas;
-    if mode == PushMode::MinimalValidate {
+    let should_validate = mode == PushMode::MinimalValidate && (!plan_only || plan_validate);
+    if should_validate {
         let ok = validate_minimal_plan(
             &repo_root,
             &git_sha,
@@ -732,14 +830,41 @@ pub async fn push(
 
     if plan_only {
         println!(
-            "plan-only: mode={} pointer_files={} required_cas_files={} manifest_entries={} manifest_bytes={}",
+            "plan-only: mode={} validated={} pointer_files={} required_cas_files={} manifest_entries={} manifest_bytes={}",
             if used_all_cas { "all-cas" } else { "minimal" },
+            should_validate,
             plan.pointer_paths.len(),
             plan.required_cas_relpaths.len(),
             manifest.entries.len(),
             manifest.total_bytes,
         );
         return Ok(());
+    }
+
+    let store = fs_remote_store(&repo_root, remote, &repo_id)?;
+    let caps = store.capabilities();
+    if !caps.supports_locking {
+        bail!("remote backend does not support push locking");
+    }
+    let _lock_guard = sync::acquire_push_lock(store.root(), force_lock)?;
+
+    if store.capabilities().supports_list_prefix {
+        let stale = store
+            .list_prefix("tx/STAGED")?
+            .into_iter()
+            .filter_map(|p| p.strip_prefix("tx/STAGED/").map(str::to_string))
+            .filter(|txid| {
+                !store
+                    .exists(&format!("tx/PUBLISHED/{txid}"))
+                    .unwrap_or(false)
+            })
+            .collect::<Vec<_>>();
+        if !stale.is_empty() {
+            eprintln!(
+                "xet-ai: warning: found staged transactions from previous pushes: {}",
+                stale.join(", ")
+            );
+        }
     }
 
     let summary = sync::push_with_manifest_store(&local_cas_root, &store, &manifest)?;
@@ -867,6 +992,68 @@ pub fn pull(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use git2::{Repository, Signature};
+    use std::future::Future;
+    use std::path::Path as StdPath;
+    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+    fn noop_waker() -> Waker {
+        unsafe fn clone(_: *const ()) -> RawWaker {
+            RawWaker::new(std::ptr::null(), &VTABLE)
+        }
+        unsafe fn noop(_: *const ()) {}
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+        unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+    }
+
+    fn block_on_ready<F: Future>(fut: F) -> F::Output {
+        let mut fut = std::pin::pin!(fut);
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(v) => v,
+            Poll::Pending => panic!("future unexpectedly pending in unit test"),
+        }
+    }
+
+    fn init_repo() -> (std::path::PathBuf, Repository) {
+        let root = std::env::temp_dir().join(format!("xet-ai-cmd-push-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create root");
+        let repo = Repository::init(&root).expect("init repo");
+        (root, repo)
+    }
+
+    fn commit_files(repo: &Repository, files: &[(&str, &[u8])], message: &str) -> String {
+        let workdir = repo.workdir().expect("workdir");
+        for (path, data) in files {
+            let p = workdir.join(path);
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent).expect("mkdirs");
+            }
+            std::fs::write(p, data).expect("write");
+        }
+
+        let mut index = repo.index().expect("index");
+        for (path, _) in files {
+            index.add_path(StdPath::new(path)).expect("add path");
+        }
+        index.write().expect("index write");
+        let tree_id = index.write_tree().expect("write tree");
+        let tree = repo.find_tree(tree_id).expect("find tree");
+        let sig = Signature::now("xet-ai", "xet-ai@example.com").expect("sig");
+
+        let oid = if let Ok(head) = repo.head() {
+            let parent = repo
+                .find_commit(head.target().expect("target"))
+                .expect("parent");
+            repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &[&parent])
+                .expect("commit")
+        } else {
+            repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &[])
+                .expect("initial")
+        };
+        oid.to_string()
+    }
 
     #[test]
     fn validation_base_is_unique() {
@@ -962,6 +1149,122 @@ mod tests {
         let _ = std::fs::remove_dir_all(store.root().join("tx/old"));
         assert!(!store.root().join("tx/old").exists());
         assert!(store.root().join("tx/new").exists());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn push_plan_only_does_not_touch_remote() {
+        let (root, repo) = init_repo();
+        let remote_root = std::env::temp_dir().join(format!("xet-ai-remote-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&remote_root).expect("remote root");
+
+        let pointer_json =
+            br#"{"hash":"0123456789abcdef0123456789abcdef01234567","file_size":123}"#;
+        let _sha = commit_files(&repo, &[("big.bin", pointer_json)], "pointer commit");
+
+        std::fs::write(
+            root.join(repo::REPO_ID_FILE),
+            "repo-id
+",
+        )
+        .expect("repo id");
+        let mut shared = ConfigFile::default();
+        shared.default_remote = Some("origin".to_string());
+        shared.remotes.insert(
+            "origin".to_string(),
+            RemoteConfig {
+                r#type: "filesystem".to_string(),
+                path: remote_root.clone(),
+            },
+        );
+        config::save_shared(&root, &shared).expect("save cfg");
+        std::fs::create_dir_all(root.join(".xet_ai").join("xet")).expect("local cas");
+
+        let prev_cwd = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("chdir");
+
+        let result = block_on_ready(push(
+            Some("origin"),
+            Some("main"),
+            false,
+            PushMode::MinimalValidate,
+            true,
+            false,
+        ));
+
+        std::env::set_current_dir(prev_cwd).expect("restore cwd");
+        result.expect("plan-only push");
+
+        assert!(!remote_root.join("tx").exists());
+        assert!(!remote_root.join("manifests").exists());
+        assert!(!remote_root.join("refs").exists());
+        assert!(!remote_root.join("pointers").exists());
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(remote_root);
+    }
+
+    #[test]
+    fn push_plan_only_skips_validation_by_default() {
+        let (root, repo) = init_repo();
+        let remote_root = std::env::temp_dir().join(format!("xet-ai-remote-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&remote_root).expect("remote root");
+
+        let pointer_json =
+            br#"{"hash":"0123456789abcdef0123456789abcdef01234567","file_size":123}"#;
+        let _sha = commit_files(&repo, &[("big.bin", pointer_json)], "pointer commit");
+
+        std::fs::write(
+            root.join(repo::REPO_ID_FILE),
+            "repo-id
+",
+        )
+        .expect("repo id");
+        let mut shared = ConfigFile::default();
+        shared.default_remote = Some("origin".to_string());
+        shared.remotes.insert(
+            "origin".to_string(),
+            RemoteConfig {
+                r#type: "filesystem".to_string(),
+                path: remote_root.clone(),
+            },
+        );
+        config::save_shared(&root, &shared).expect("save cfg");
+        std::fs::create_dir_all(root.join(".xet_ai").join("xet")).expect("local cas");
+
+        reset_validation_call_count();
+
+        let prev_cwd = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("chdir");
+        let result = block_on_ready(push(
+            Some("origin"),
+            Some("main"),
+            false,
+            PushMode::MinimalValidate,
+            true,
+            false,
+        ));
+        std::env::set_current_dir(prev_cwd).expect("restore cwd");
+        result.expect("plan-only push");
+
+        assert_eq!(validation_call_count(), 0);
+        assert!(!root.join(".xet_ai").join("validate").exists());
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(remote_root);
+    }
+
+    #[test]
+    fn doctor_report_flags_missing_basics() {
+        let (root, _repo) = init_repo();
+        let report = collect_doctor_report(&root).expect("doctor report");
+
+        assert!(!report.critical_issues.is_empty());
+        assert!(report
+            .warnings
+            .iter()
+            .any(|w| w.contains("no tracked patterns") || w.contains("no default remote")));
 
         let _ = std::fs::remove_dir_all(root);
     }

@@ -52,6 +52,8 @@ xet-ai status
 xet-ai doctor
 xet-ai track "*.bin" "*.parquet"
 xet-ai push origin --ref main --plan-only
+# optional: validate plan by hydrating representative data
+xet-ai push origin --ref main --plan-only --validate
 xet-ai remote refs origin
 xet-ai remote tx list origin
 xet-ai remote tx gc origin --older-than 120
@@ -71,6 +73,7 @@ Local values override shared values. `auto_pull_on_smudge` is local-only and opt
 - Push is transactional (staged then published markers).
 - Pull/push perform verified transfer checks (size always, hash for small files).
 - Default minimal push validates a representative hydration and falls back to all-CAS if validation fails.
+- `--plan-only` does not validate by default; add `--validate` to run validation during planning.
 - `--minimal-no-validate` exists for developers and prints a warning.
 
 ## Known limitations (Alpha)
