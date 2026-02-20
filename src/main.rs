@@ -24,7 +24,15 @@ enum Commands {
     Init {
         #[arg(long)]
         init_config: bool,
+        #[arg(long = "track")]
+        track: Vec<String>,
     },
+    Status,
+    Track {
+        patterns: Vec<String>,
+    },
+    Doctor,
+    Version,
     Clean {
         #[arg(long)]
         path: Option<PathBuf>,
@@ -93,7 +101,14 @@ enum RemoteCommands {
 
 #[derive(Subcommand, Debug)]
 enum RemoteTxCommands {
-    List { remote: Option<String> },
+    List {
+        remote: Option<String>,
+    },
+    Gc {
+        remote: Option<String>,
+        #[arg(long, default_value_t = 60)]
+        older_than: u64,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -132,7 +147,19 @@ fn main() {
 async fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Init { init_config } => commands::init(init_config),
+        Commands::Init { init_config, track } => commands::init(init_config, &track),
+        Commands::Status => commands::status(),
+        Commands::Track { patterns } => commands::track(&patterns),
+        Commands::Doctor => commands::doctor(),
+        Commands::Version => {
+            println!("xet-ai {}", env!("CARGO_PKG_VERSION"));
+            println!(
+                "build_commit: {}",
+                option_env!("XET_AI_GIT_COMMIT").unwrap_or("unknown")
+            );
+            println!("xet_core_rev: a7661a7e63626466561e88e63113001a193a36ee");
+            Ok(())
+        }
         Commands::Clean { path } => clean(path).await,
         Commands::Smudge { path } => smudge(path).await,
         Commands::Push {
@@ -166,6 +193,9 @@ async fn run() -> Result<()> {
             RemoteCommands::Head { remote } => commands::remote_head(remote.as_deref()),
             RemoteCommands::Tx { command } => match command {
                 RemoteTxCommands::List { remote } => commands::remote_tx_list(remote.as_deref()),
+                RemoteTxCommands::Gc { remote, older_than } => {
+                    commands::remote_tx_gc(remote.as_deref(), older_than)
+                }
             },
         },
         Commands::Debug { command } => match command {

@@ -38,6 +38,7 @@ git config user.name "xet-ai"
 git branch -m main
 
 xet-ai init --init-config
+xet-ai track "*.bin"
 if [[ ! -f .xet_ai_repo_id ]]; then
   echo "missing .xet_ai_repo_id" >&2
   exit 1
@@ -140,6 +141,7 @@ git clone "$repoA" "$repoB" >/dev/null
 
 cd "$repoB"
 xet-ai init
+xet-ai doctor
 if ! python3 - <<'PY'
 import json
 from pathlib import Path

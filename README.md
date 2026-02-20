@@ -1,75 +1,91 @@
 # xet-ai
 
-`xet-ai` is a local-only MVP for CAS-first blob storage in Git using HuggingFace `xet-core`.
+`xet-ai` is an offline-first alpha for CAS-backed large-file workflows in Git using `xet-core` locally.
 
-## Build
+## Alpha install
+
+### Option 1: local install script
+
+```bash
+bash scripts/install-local.sh
+```
+
+### Option 2: manual
 
 ```bash
 cargo build --release
+cp target/release/xet-ai ~/.local/bin/xet-ai
 ```
 
-## Dependency pinning
+## Quickstart (Alpha)
 
-`xet-core` dependencies are pinned to a specific git revision in `Cargo.toml`.
-
-## Repo identity
-
-`xet-ai init` creates a tracked `.xet_ai_repo_id` file if missing. Commit this file so all clones share the same remote namespace.
-
-## Shared vs local config
-
-- Shared (tracked): `.xet_ai.toml`
-- Local overlay (ignored): `.xet_ai/config.local.toml`
-
-Effective config is merged with local values overriding shared values.
+Machine A:
 
 ```bash
-xet-ai init --init-config
-xet-ai remote add origin /tmp/xet-ai-remote         # writes shared config
-xet-ai remote add scratch /tmp/private --local      # writes local overlay
-xet-ai remote set-default origin                     # shared default_remote
+git init myrepo
+cd myrepo
+xet-ai init --init-config --track "*.bin" "*.parquet"
+xet-ai remote add origin /tmp/xet-remote
+xet-ai remote set-default origin
+
+# create or edit files
+git add .
+git commit -m "initial"
+xet-ai push origin --ref main
 ```
 
-Local-only setting `auto_pull_on_smudge` can be set in `.xet_ai/config.local.toml`.
-
-## Manifest + refs remote model
-
-Push writes CAS objects and manifest refs under:
-
-- `<remote>/<repo_id>/xet/...`
-- `<remote>/<repo_id>/manifests/<git_sha>.json`
-- `<remote>/<repo_id>/manifests/HEAD`
-- `<remote>/<repo_id>/refs/<refname>`
-
-`push` updates both manifest HEAD and `refs/<refname>` (default refname is current git branch; falls back to `HEAD` in detached state).
-
-`pull` resolves data in this order:
-- `--ref <40-hex-sha>` => direct manifest SHA
-- `--ref <name>` => resolve remote `refs/<name>`
-- no `--ref` => remote `manifests/HEAD`
-
-Useful commands:
+Machine B:
 
 ```bash
+git clone <machine-a-repo-path> myrepo
+cd myrepo
+xet-ai init
+xet-ai doctor
+xet-ai pull origin --ref main
+git checkout -f -- .
+```
+
+## Useful commands
+
+```bash
+xet-ai status
+xet-ai doctor
+xet-ai track "*.bin" "*.parquet"
 xet-ai remote refs origin
-xet-ai remote head origin
+xet-ai remote tx list origin
+xet-ai remote tx gc origin --older-than 120
 xet-ai manifest list
-xet-ai manifest show <sha>
 xet-ai manifest verify <sha>
 ```
 
-## Smudge auto-pull (opt-in)
+## Shared vs local config
 
-If local config enables `auto_pull_on_smudge=true` and a `default_remote` exists, smudge will attempt one automatic pull+retry on missing CAS data.
+- Shared/tracked: `.xet_ai.toml`
+- Local overlay: `.xet_ai/config.local.toml`
 
-## Diagnostics
+Local values override shared values. `auto_pull_on_smudge` is local-only and opt-in.
+
+## Safety behavior
+
+- Push is transactional (staged then published markers).
+- Pull/push perform verified transfer checks (size always, hash for small files).
+- Default minimal push validates a representative hydration and falls back to all-CAS if validation fails.
+- `--minimal-no-validate` exists for developers and prints a warning.
+
+## Known limitations (Alpha)
+
+- Reachability planning is heuristic and may fall back to all-CAS.
+- Filesystem remote backend only.
+- No full remote GC of published objects yet (transaction cleanup only).
+- No HuggingFace Hub / network backend integration yet.
+
+## Development checks
 
 ```bash
-xet-ai debug cas-tree
-```
-
-## Run end-to-end demo
-
-```bash
+cargo fmt --check
+cargo clippy -- -D warnings
+cargo test --workspace
+cargo build --release
+shellcheck scripts/e2e.sh
 bash scripts/e2e.sh
 ```
